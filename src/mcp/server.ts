@@ -1,22 +1,14 @@
-import express from "express";
+// src/mcp/server.ts
+import type express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-/**
- * Start an MCP server over Streamable HTTP on /mcp
- */
-export function startMcpHttp(appBaseUrl: string, port: number) {
-  const app = express();
-  app.use(express.json());
+/** מצמיד את MCP ל־Express קיים, ללא listen נוסף */
+export function attachMcp(app: express.Express, appBaseUrl: string) {
+  const server = new McpServer({ name: "hebrew-tts-mcp", version: "1.0.0" });
 
-  const server = new McpServer({
-    name: "hebrew-tts-mcp",
-    version: "1.0.0",
-  });
-
-  // ---- Zod schema (object) + pass .shape to registerTool ----
   const getTtsInput = z.object({
     text: z.string().min(1, "text required"),
     voice_id: z.string().optional(),
@@ -25,18 +17,15 @@ export function startMcpHttp(appBaseUrl: string, port: number) {
     output_format: z.string().default("mp3_44100_128").optional(),
   });
 
-  // Tool: returns a playable stream URL for Hebrew TTS
   server.registerTool(
     "get_hebrew_tts_stream_url",
     {
       title: "Get Hebrew TTS stream URL",
-      description:
-        "Return a URL that streams Hebrew TTS audio (HTTP chunked MP3) via ElevenLabs v3.",
-      inputSchema: getTtsInput.shape, // <<--- ZodRawShape expected
+      description: "Return a URL that streams Hebrew TTS audio (HTTP chunked MP3) via ElevenLabs v3.",
+      inputSchema: getTtsInput.shape,
     },
-    async (args: z.infer<typeof getTtsInput>) => {
+    async (args) => {
       const { text, voice_id, speed, model, output_format } = args;
-
       const q = new URLSearchParams({
         text,
         ...(voice_id ? { voice_id } : {}),
@@ -44,13 +33,10 @@ export function startMcpHttp(appBaseUrl: string, port: number) {
         ...(model ? { model } : {}),
         ...(output_format ? { output_format } : {}),
       });
-
-      const url = `${appBaseUrl}/stream/tts?${q.toString()}`;
-      return { content: [{ type: "text", text: url }] };
+      return { content: [{ type: "text", text: `${appBaseUrl}/stream/tts?${q.toString()}` }] };
     }
   );
 
-  // Discoverable resource template (dynamic URL)
   server.registerResource(
     "hebrew-tts-stream",
     new ResourceTemplate(
@@ -62,22 +48,15 @@ export function startMcpHttp(appBaseUrl: string, port: number) {
       description: "HTTP-chunked MP3 stream via ElevenLabs v3.",
       mimeType: "audio/mpeg",
     },
-    // כל content חייב להכיל לפחות text או blob; מוסיפים גם uri
     async (uri) => ({
-      contents: [
-        {
-          uri: uri.href,
-          text: uri.href,
-          mimeType: "audio/mpeg",
-        },
-      ],
+      contents: [{ uri: uri.href, text: uri.href, mimeType: "audio/mpeg" }],
     })
   );
 
-  // Streamable HTTP route for MCP
+  // מסלול MCP על אותו app קיים
   app.post("/mcp", async (req, res) => {
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(), // נדרש ב-1.21.x
+      sessionIdGenerator: () => randomUUID(),
       enableJsonResponse: true,
     });
     res.on("close", () => transport.close());
@@ -85,9 +64,5 @@ export function startMcpHttp(appBaseUrl: string, port: number) {
     await transport.handleRequest(req, res, req.body);
   });
 
-  app.listen(port, () => {
-    console.log(`MCP on http://0.0.0.0:${port}/mcp`);
-  });
-
-  return { endpoint: `http://0.0.0.0:${port}/mcp` };
+  return { endpoint: `${appBaseUrl}/mcp` };
 }
