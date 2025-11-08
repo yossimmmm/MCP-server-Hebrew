@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"
-  },
+}
+,
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.21.1",
     "cors": "^2.8.5",

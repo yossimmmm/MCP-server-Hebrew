@@ -1,4 +1,4 @@
-// src/http/app.ts (רק הראוט /stream/tts)
+// src/http/app.ts
 import express from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
@@ -25,30 +25,25 @@ export function createHttpApp() {
       if (Number.isNaN(speed) || speed < 0.5 || speed > 1.5) {
         return res.status(400).json({ error: "speed must be 0.5–1.5" });
       }
-      const output_format = String(req.query.output_format || process.env.DEFAULT_OUTPUT_FORMAT || "mp3_44100_128");
+      const output_format = String(
+        req.query.output_format || process.env.DEFAULT_OUTPUT_FORMAT || "mp3_44100_128"
+      );
 
       const apiKey = process.env.ELEVENLABS_API_KEY;
       if (!apiKey) return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
 
-      // פרמטרים מומלצים לסטרימינג
-      const qs = new URLSearchParams({
-        optimize_streaming_latency: "0",
-        output_format,
-      });
+      // v3: DO NOT send optimize_streaming_latency (causes 400)
+      const qs = new URLSearchParams({ output_format });
       const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
 
-      const body = {
+      // Minimal body for v3; add voice_settings only if speed != 1.0
+      const body: Record<string, any> = {
         text,
-        model_id: model,   // <-- חשוב: model_id
-        voice_settings: {
-          stability: 1,
-          similarity_boost: 1,
-          style: 0,
-          use_speaker_boost: true,
-          speed,
-        },
-        language_code: "he"
+        model_id: model,          // correct field for v3
+        output_format,
+        language_code: "he",      // or "he-IL"
       };
+      if (speed !== 1.0) body.voice_settings = { speed };
 
       const upstream = await fetch(url, {
         method: "POST",
@@ -67,7 +62,6 @@ export function createHttpApp() {
 
       res.setHeader("Content-Type", output_format.startsWith("mp3") ? "audio/mpeg" : "audio/*");
       res.setHeader("Cache-Control", "no-store");
-
       Readable.fromWeb(upstream.body as any).pipe(res);
     } catch (err: any) {
       console.error("TTS error:", err);
