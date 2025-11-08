@@ -1,19 +1,12 @@
 // src/mcp/server.ts
 import type express from "express";
+import rawBody from "raw-body";
 import { randomUUID } from "node:crypto";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 export function attachMcp(app: express.Express, appBaseUrl: string) {
-  // לוג בסיסי לכל בקשות MCP
-  app.use((req, _res, next) => {
-    if (req.path === "/mcp") {
-      console.log(`[MCP] ${req.method} ${req.path}`);
-    }
-    next();
-  });
-
   const server = new McpServer({ name: "hebrew-tts-mcp", version: "1.0.0" });
 
   const getTtsInput = z.object({
@@ -46,56 +39,44 @@ export function attachMcp(app: express.Express, appBaseUrl: string) {
 
   server.registerResource(
     "hebrew-tts-stream",
-    new ResourceTemplate(
-      `${appBaseUrl}/stream/tts?text={text}&voice_id={voice_id}&speed={speed}`,
-      { list: undefined }
-    ),
-    {
-      title: "Hebrew TTS stream",
-      description: "HTTP-chunked MP3 stream via ElevenLabs v3.",
-      mimeType: "audio/mpeg",
-    },
-    async (uri) => ({
-      contents: [{ uri: uri.href, text: uri.href, mimeType: "audio/mpeg" }],
-    })
+    new ResourceTemplate(`${appBaseUrl}/stream/tts?text={text}&voice_id={voice_id}&speed={speed}`, { list: undefined }),
+    { title: "Hebrew TTS stream", description: "HTTP-chunked MP3 stream via ElevenLabs v3.", mimeType: "audio/mpeg" },
+    async (uri) => ({ contents: [{ uri: uri.href, text: uri.href, mimeType: "audio/mpeg" }] })
   );
 
-  // Preflight (אם הם עושים OPTIONS)
-  app.options("/mcp", (_req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "content-type,authorization,x-mcp-secret");
-    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-    res.status(204).end();
-  });
-
-  // GET לבריאות/דיאגנוסטיקה (חלק מהכלים עושים GET בבדיקה)
+  // בריאות/זיהוי פשוט
   app.get("/mcp", (_req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(200).json({
-      ok: true,
-      transport: "streamable-http",
-      server: "hebrew-tts-mcp",
-    });
+    res.json({ ok: true, transport: "streamable-http", server: "hebrew-tts-mcp" });
   });
 
-  // POST – Streamable HTTP
+  // *** חשוב: לא להשתמש ב-express.json עבור /mcp ***
   app.post("/mcp", async (req, res) => {
     try {
+      const accept = String(req.headers.accept || "");
+      if (!(accept.includes("application/json") && accept.includes("text/event-stream"))) {
+        return res.status(406).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Not Acceptable: Client must accept both application/json and text/event-stream" },
+          id: null,
+        });
+      }
+
+      // גוף גולמי (אל תתן ל-body parser לבלוע את הזרם)
+      const buf = await rawBody(req, { encoding: "utf8", limit: "2mb" });
+      let body: any = undefined;
+      try { body = buf ? JSON.parse(buf) : undefined; } catch { body = undefined; }
+
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         enableJsonResponse: true,
       });
 
-      res.setHeader("Access-Control-Allow-Origin", "*");
       res.on("close", () => transport.close());
-
       await server.connect(transport);
-      await transport.handleRequest(req, res, req.body ?? {});
-    } catch (e: any) {
-      console.error("[MCP] handleRequest error:", e);
-      res
-        .status(500)
-        .json({ error: "mcp_failed", message: e?.message || String(e) });
+      await transport.handleRequest(req, res, body);
+    } catch (err: any) {
+      console.error("[MCP] error:", err);
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32000, message: "Internal Server Error" }, id: null });
     }
   });
 
