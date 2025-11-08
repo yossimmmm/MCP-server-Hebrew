@@ -8,7 +8,6 @@ const XI_API = "https://api.elevenlabs.io/v1";
 export function createHttpApp() {
   const app = express();
   app.use(cors({ origin: "*", maxAge: 600 }));
-  app.use(express.json({ limit: "1mb" }));
 
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
