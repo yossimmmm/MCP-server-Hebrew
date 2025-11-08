@@ -1,4 +1,4 @@
-// src/http/app.ts (רק הראוט /stream/tts)
+// src/http/app.ts
 import express from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
@@ -6,7 +6,6 @@ const XI_API = "https://api.elevenlabs.io/v1";
 export function createHttpApp() {
     const app = express();
     app.use(cors({ origin: "*", maxAge: 600 }));
-    app.use(express.json({ limit: "1mb" }));
     app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
     app.get("/stream/tts", async (req, res) => {
         try {
@@ -25,24 +24,18 @@ export function createHttpApp() {
             const apiKey = process.env.ELEVENLABS_API_KEY;
             if (!apiKey)
                 return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
-            // פרמטרים מומלצים לסטרימינג
-            const qs = new URLSearchParams({
-                optimize_streaming_latency: "0",
-                output_format,
-            });
+            // v3: DO NOT send optimize_streaming_latency (causes 400)
+            const qs = new URLSearchParams({ output_format });
             const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
+            // Minimal body for v3; add voice_settings only if speed != 1.0
             const body = {
                 text,
-                model_id: model, // <-- חשוב: model_id
-                voice_settings: {
-                    stability: 1,
-                    similarity_boost: 1,
-                    style: 0,
-                    use_speaker_boost: true,
-                    speed,
-                },
-                language_code: "he"
+                model_id: model, // correct field for v3
+                output_format,
+                language_code: "he", // or "he-IL"
             };
+            if (speed !== 1.0)
+                body.voice_settings = { speed };
             const upstream = await fetch(url, {
                 method: "POST",
                 headers: {
