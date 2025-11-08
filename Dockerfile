@@ -22,4 +22,11 @@ COPY --from=build /app/dist ./dist
 # במידה ויש קובץ SA של גוגל:
 # COPY sa.json /app/sa.json
 
-CMD ["node", "dist/index.js"]
+FROM node:20-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+CMD ["node","dist/index.js"]
+

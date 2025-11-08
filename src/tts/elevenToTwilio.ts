@@ -1,8 +1,8 @@
-// src/telephony/elevenToTwilio.ts
 import { spawn } from "child_process";
+import WebSocket from "ws";
 
 export async function speakTextToTwilio(
-  ws: any,
+  ws: WebSocket,
   streamSid: string,
   text: string,
   voiceId?: string
@@ -16,8 +16,10 @@ export async function speakTextToTwilio(
   const res = await fetch(url.toString());
   if (!res.ok || !res.body) throw new Error("TTS HTTP " + res.status);
 
-  // clear any pending audio on the call
-  ws.send(JSON.stringify({ event: "clear", streamSid }));
+  // לרוקן תור נגן
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ event: "clear", streamSid, track: "outbound" }));
+  }
 
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
@@ -29,15 +31,20 @@ export async function speakTextToTwilio(
     "pipe:1",
   ]);
 
-  // @ts-ignore Node ReadableStream piping
+  // במקרה ואין ffmpeg תקין, תראה שגיאה ברורה
+  ff.stderr.on("data", d => console.error("[ffmpeg]", d.toString()));
+
+  // @ts-ignore
   res.body.pipe(ff.stdin);
 
   ff.stdout.on("data", (chunk: Buffer) => {
     for (let i = 0; i + 160 <= chunk.length; i += 160) {
       const frame = chunk.subarray(i, i + 160);
+      if (ws.readyState !== WebSocket.OPEN) break;
       ws.send(JSON.stringify({
         event: "media",
         streamSid,
+        track: "outbound",                 // <<< חשוב
         media: { payload: frame.toString("base64") }
       }));
     }
@@ -45,7 +52,11 @@ export async function speakTextToTwilio(
 
   await new Promise<void>((resolve, reject) => {
     ff.once("close", () => {
-      try { ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } })); } catch {}
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ event: "mark", streamSid, track: "outbound", mark: { name: "tts_end" } }));
+        }
+      } catch {}
       resolve();
     });
     ff.once("error", reject);
