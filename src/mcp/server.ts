@@ -5,8 +5,15 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-/** מצמיד את MCP ל־Express קיים, ללא listen נוסף */
 export function attachMcp(app: express.Express, appBaseUrl: string) {
+  // לוג בסיסי לכל בקשות MCP
+  app.use((req, _res, next) => {
+    if (req.path === "/mcp") {
+      console.log(`[MCP] ${req.method} ${req.path}`);
+    }
+    next();
+  });
+
   const server = new McpServer({ name: "hebrew-tts-mcp", version: "1.0.0" });
 
   const getTtsInput = z.object({
@@ -25,7 +32,7 @@ export function attachMcp(app: express.Express, appBaseUrl: string) {
       inputSchema: getTtsInput.shape,
     },
     async (args) => {
-      const { text, voice_id, speed, model, output_format } = args;
+      const { text, voice_id, speed, model, output_format } = args as z.infer<typeof getTtsInput>;
       const q = new URLSearchParams({
         text,
         ...(voice_id ? { voice_id } : {}),
@@ -53,15 +60,43 @@ export function attachMcp(app: express.Express, appBaseUrl: string) {
     })
   );
 
-  // מסלול MCP על אותו app קיים
-  app.post("/mcp", async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      enableJsonResponse: true,
+  // Preflight (אם הם עושים OPTIONS)
+  app.options("/mcp", (_req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "content-type,authorization,x-mcp-secret");
+    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+    res.status(204).end();
+  });
+
+  // GET לבריאות/דיאגנוסטיקה (חלק מהכלים עושים GET בבדיקה)
+  app.get("/mcp", (_req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(200).json({
+      ok: true,
+      transport: "streamable-http",
+      server: "hebrew-tts-mcp",
     });
-    res.on("close", () => transport.close());
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+  });
+
+  // POST – Streamable HTTP
+  app.post("/mcp", async (req, res) => {
+    try {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true,
+      });
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.on("close", () => transport.close());
+
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body ?? {});
+    } catch (e: any) {
+      console.error("[MCP] handleRequest error:", e);
+      res
+        .status(500)
+        .json({ error: "mcp_failed", message: e?.message || String(e) });
+    }
   });
 
   return { endpoint: `${appBaseUrl}/mcp` };
