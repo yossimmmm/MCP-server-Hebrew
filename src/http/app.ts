@@ -1,4 +1,3 @@
-// src/http/app.ts
 import express from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
@@ -24,6 +23,7 @@ export function createHttpApp() {
       if (Number.isNaN(speed) || speed < 0.5 || speed > 1.5) {
         return res.status(400).json({ error: "speed must be 0.5–1.5" });
       }
+
       const output_format = String(
         req.query.output_format || process.env.DEFAULT_OUTPUT_FORMAT || "mp3_44100_128"
       );
@@ -31,16 +31,15 @@ export function createHttpApp() {
       const apiKey = process.env.ELEVENLABS_API_KEY;
       if (!apiKey) return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
 
-      // v3: DO NOT send optimize_streaming_latency (causes 400)
       const qs = new URLSearchParams({ output_format });
       const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
 
-      // Minimal body for v3; add voice_settings only if speed != 1.0
+      // Keep body minimal for v3
       const body: Record<string, any> = {
         text,
-        model_id: model,          // correct field for v3
+        model_id: model,
         output_format,
-        language_code: "he",      // or "he-IL"
+        // language_code: "he-IL" // optional; some voices may mute with this set
       };
       if (speed !== 1.0) body.voice_settings = { speed };
 
@@ -49,7 +48,7 @@ export function createHttpApp() {
         headers: {
           "xi-api-key": apiKey,
           "content-type": "application/json",
-          "accept": "audio/mpeg",
+          accept: "audio/mpeg",
         },
         body: JSON.stringify(body),
       });
@@ -59,7 +58,7 @@ export function createHttpApp() {
         return res.status(502).json({ error: "elevenlabs upstream error", status: upstream.status, msg });
       }
 
-      res.setHeader("Content-Type", output_format.startsWith("mp3") ? "audio/mpeg" : "audio/*");
+      res.setHeader("Content-Type", "audio/mpeg");
       res.setHeader("Cache-Control", "no-store");
       Readable.fromWeb(upstream.body as any).pipe(res);
     } catch (err: any) {

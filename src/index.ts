@@ -1,4 +1,3 @@
-// src/index.ts
 import "dotenv/config";
 import express from "express";
 import http from "http";
@@ -10,7 +9,11 @@ import { attachTwilioWs } from "./telephony/wsTwilio.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-const PUBLIC_WS = PUBLIC.replace(/^http/, "ws") + "/ws/twilio";
+
+// Build a correct WS/WSS URL from PUBLIC (http -> ws, https -> wss)
+const wsUrl = new URL("/ws/twilio", PUBLIC);
+wsUrl.protocol = wsUrl.protocol.replace("http", "ws");
+const PUBLIC_WS = wsUrl.toString();
 
 const app = createHttpApp();
 app.use(cors({ origin: "*", maxAge: 600 }));
@@ -30,3 +33,11 @@ server.listen(PORT, () => {
   console.log(`Twilio TwiML POST ${PUBLIC}/voice`);
   console.log(`Twilio WS at ${PUBLIC_WS}`);
 });
+
+export type TtsQuery = {
+  text: string;
+  voice_id?: string;
+  speed?: number;
+  model?: string;
+  output_format?: string;
+};

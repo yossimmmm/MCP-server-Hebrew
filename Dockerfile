@@ -1,32 +1,24 @@
-# -------- deps/build --------
-FROM node:20-alpine AS build
+# -------- build --------
+FROM node:20-slim AS build
 WORKDIR /app
-COPY package*.json* ./
+COPY package*.json ./
 RUN npm ci
 COPY . .
-RUN npm run build
+RUN npm run build  # מייצר dist/
 
 # -------- runtime --------
-FROM node:20-alpine
+FROM node:20-slim
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
 
-# ffmpeg למעבר MP3 -> μ-law
-RUN apk add --no-cache ffmpeg
+# ffmpeg נדרש להמרת MP3 -> μ-law 8k
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app/package*.json* ./
-RUN npm ci --omit=dev
-COPY --from=build /app/dist ./dist
-# במידה ויש קובץ SA של גוגל:
-# COPY sa.json /app/sa.json
-
-FROM node:20-slim
-WORKDIR /app
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm ci --omit=dev
-COPY . .
-CMD ["node","dist/index.js"]
+COPY --from=build /app/dist ./dist
+# אם יש SA לגוגל: COPY sa.json /app/sa.json
 
+CMD ["node","dist/index.js"]
