@@ -3,8 +3,8 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import cors from "cors";
-import { createHttpApp } from "./http/app.js";      // יש לך כבר
-import { attachMcp } from "./mcp/server.js";        // יש לך כבר
+import { createHttpApp } from "./http/app.js";
+import { attachMcp } from "./mcp/server.js";
 import { twimlHandler } from "./telephony/twiml.js";
 import { attachTwilioWs } from "./telephony/wsTwilio.js";
 
@@ -15,13 +15,13 @@ const PUBLIC_WS = PUBLIC.replace(/^http/, "ws") + "/ws/twilio";
 const app = createHttpApp();
 app.use(cors({ origin: "*", maxAge: 600 }));
 
-// TwiML לטלפון
+// Twilio → TwiML
 app.post("/voice", twimlHandler(PUBLIC_WS));
 
-// MCP (קיים)
+// MCP
 attachMcp(app, PUBLIC);
 
-// יצירת HTTP server ושידוך WS
+// HTTP + WS
 const server = http.createServer(app);
 attachTwilioWs(server);
 

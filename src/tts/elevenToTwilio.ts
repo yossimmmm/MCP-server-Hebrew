@@ -1,91 +1,53 @@
-// src/tts/elevenToTwilio.ts
-import { Readable } from "stream";
+// src/telephony/elevenToTwilio.ts
 import { spawn } from "child_process";
 
-const XI_API = "https://api.elevenlabs.io/v1";
+export async function speakTextToTwilio(
+  ws: any,
+  streamSid: string,
+  text: string,
+  voiceId?: string
+) {
+  const base = process.env.PUBLIC_BASE_URL!;
+  const url = new URL(base + "/stream/tts");
+  url.searchParams.set("text", text);
+  url.searchParams.set("output_format", "mp3_44100_128");
+  if (voiceId) url.searchParams.set("voice_id", voiceId);
 
-type SpeakArgs = {
-  ws: any;
-  streamSid: string;
-  text: string;
-  voiceId: string;
-  speed?: number;     // 0.5–1.5
-  model?: string;     // "eleven_v3"
-};
+  const res = await fetch(url.toString());
+  if (!res.ok || !res.body) throw new Error("TTS HTTP " + res.status);
 
-export async function speakElevenToTwilio(args: SpeakArgs) {
-  const { ws, streamSid, text, voiceId, speed = 1.0, model = "eleven_v3" } = args;
-  if (!process.env.ELEVENLABS_API_KEY) throw new Error("ELEVENLABS_API_KEY not set");
-  if (!voiceId) throw new Error("missing voiceId");
+  // clear any pending audio on the call
+  ws.send(JSON.stringify({ event: "clear", streamSid }));
 
-  // בקשת סטרים MP3 מ-ElevenLabs v3
-  const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=mp3_44100_128`;
-  const body: Record<string, any> = {
-    text,
-    model_id: model,
-    output_format: "mp3_44100_128",
-    language_code: "he"
-  };
-  if (speed !== 1.0) body.voice_settings = { speed };
-
-  const upstream = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": process.env.ELEVENLABS_API_KEY!,
-      "content-type": "application/json",
-      "accept": "audio/mpeg"
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!upstream.ok || !upstream.body) {
-    const msg = await upstream.text().catch(() => upstream.statusText);
-    throw new Error(`XI upstream error ${upstream.status} ${msg}`);
-  }
-
-  // ffmpeg: mp3 -> μ-law 8k (raw)
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
-    "-f", "mp3",
     "-i", "pipe:0",
-    "-ac", "1",
-    "-ar", "8000",
-    "-f", "mulaw",
     "-acodec", "pcm_mulaw",
-    "pipe:1"
-  ], { stdio: ["pipe", "pipe", "inherit"] });
+    "-ar", "8000",
+    "-ac", "1",
+    "-f", "mulaw",
+    "pipe:1",
+  ]);
 
-  // העבר את הסטרים מה-fetch ל-ffmpeg stdin
-  Readable.fromWeb(upstream.body as any).pipe(ff.stdin);
+  // @ts-ignore Node ReadableStream piping
+  res.body.pipe(ff.stdin);
 
-  // Twilio מצפה מסגרות של ~20ms → 160 בייטים (8kHz, μ-law = 1 byte לדגימה)
-  const FRAME_BYTES = 160;
-  let carry = Buffer.alloc(0);
+  ff.stdout.on("data", (chunk: Buffer) => {
+    for (let i = 0; i + 160 <= chunk.length; i += 160) {
+      const frame = chunk.subarray(i, i + 160);
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: frame.toString("base64") }
+      }));
+    }
+  });
 
   await new Promise<void>((resolve, reject) => {
-    ff.stdout.on("data", (chunk: Buffer) => {
-      carry = Buffer.concat([carry, chunk]);
-      while (carry.length >= FRAME_BYTES) {
-        const frame = carry.subarray(0, FRAME_BYTES);
-        carry = carry.subarray(FRAME_BYTES);
-        const payloadB64 = frame.toString("base64");
-        try {
-          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: payloadB64 } }));
-        } catch (e) {
-          // אם ה-WS נסגר — להפסיק
-          ff.kill("SIGKILL");
-          reject(e);
-          return;
-        }
-      }
-    });
-
-    ff.on("close", () => {
-      // נשלח CLEAR לוודא שאין זנבות ברינג באפר בצד Twilio
-      try { ws.send(JSON.stringify({ event: "clear", streamSid })); } catch {}
+    ff.once("close", () => {
+      try { ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } })); } catch {}
       resolve();
     });
-
-    ff.on("error", reject);
+    ff.once("error", reject);
   });
 }
