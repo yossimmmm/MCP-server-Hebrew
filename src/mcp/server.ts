@@ -9,6 +9,7 @@ import { z } from "zod";
 export function attachMcp(app: express.Express, appBaseUrl: string) {
   const server = new McpServer({ name: "hebrew-tts-mcp", version: "1.0.0" });
 
+  // ---------- tools ----------
   const getTtsInput = z.object({
     text: z.string().min(1, "text required"),
     voice_id: z.string().optional(),
@@ -39,44 +40,53 @@ export function attachMcp(app: express.Express, appBaseUrl: string) {
 
   server.registerResource(
     "hebrew-tts-stream",
-    new ResourceTemplate(`${appBaseUrl}/stream/tts?text={text}&voice_id={voice_id}&speed={speed}`, { list: undefined }),
-    { title: "Hebrew TTS stream", description: "HTTP-chunked MP3 stream via ElevenLabs v3.", mimeType: "audio/mpeg" },
+    new ResourceTemplate(
+      `${appBaseUrl}/stream/tts?text={text}&voice_id={voice_id}&speed={speed}`,
+      { list: undefined }
+    ),
+    {
+      title: "Hebrew TTS stream",
+      description: "HTTP-chunked MP3 stream via ElevenLabs v3.",
+      mimeType: "audio/mpeg",
+    },
     async (uri) => ({ contents: [{ uri: uri.href, text: uri.href, mimeType: "audio/mpeg" }] })
   );
 
-  // בריאות/זיהוי פשוט
+  // בריאות
   app.get("/mcp", (_req, res) => {
     res.json({ ok: true, transport: "streamable-http", server: "hebrew-tts-mcp" });
   });
 
-  // *** חשוב: לא להשתמש ב-express.json עבור /mcp ***
+  // ---------- Transport יחיד ומתמשך ----------
+  // חשוב: לא יוצרים Transport חדש לכל בקשה, ולא סוגרים אותו ב-close של התגובה.
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    enableJsonResponse: true,
+  });
+
+  let connected = false;
+  async function ensureConnected() {
+    if (!connected) {
+      await server.connect(transport);
+      connected = true;
+    }
+  }
+
   app.post("/mcp", async (req, res) => {
     try {
-      const accept = String(req.headers.accept || "");
-      if (!(accept.includes("application/json") && accept.includes("text/event-stream"))) {
-        return res.status(406).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Not Acceptable: Client must accept both application/json and text/event-stream" },
-          id: null,
-        });
-      }
-
-      // גוף גולמי (אל תתן ל-body parser לבלוע את הזרם)
+      // אל תחסום על Accept; תן ל-SDK לנהל תאימות.
       const buf = await rawBody(req, { encoding: "utf8", limit: "2mb" });
-      let body: any = undefined;
+      let body: any;
       try { body = buf ? JSON.parse(buf) : undefined; } catch { body = undefined; }
 
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        enableJsonResponse: true,
-      });
-
-      res.on("close", () => transport.close());
-      await server.connect(transport);
+      await ensureConnected();
+      // אין res.on('close', transport.close) — זה היה מוחק Sessions בין קריאות.
       await transport.handleRequest(req, res, body);
     } catch (err: any) {
       console.error("[MCP] error:", err);
-      res.status(500).json({ jsonrpc: "2.0", error: { code: -32000, message: "Internal Server Error" }, id: null });
+      res
+        .status(500)
+        .json({ jsonrpc: "2.0", error: { code: -32000, message: "Internal Server Error" }, id: null });
     }
   });
 
