@@ -25,8 +25,10 @@ export function attachTwilioWs(server: any) {
 
       switch (msg.event) {
         case "start": {
-          const { streamSid } = msg;
+          const streamSid: string | undefined = msg.start?.streamSid ?? msg.streamSid;
+          if (!streamSid) { console.error("[WS] start event missing streamSid"); break; }
           console.log("[WS] start", streamSid);
+
           sessions.get(streamSid)?.end();
           sessions.set(streamSid, createGoogleSession());
 
@@ -39,22 +41,30 @@ export function attachTwilioWs(server: any) {
         }
 
         case "media": {
-          const { streamSid } = msg;
+          const streamSid: string | undefined = msg.streamSid;
+          if (!streamSid) break;
           if ((++mediaCount % 50) === 0) console.log("[WS] inbound media frames:", mediaCount);
           const s = sessions.get(streamSid);
           if (!s) break;
-          const b64 = msg.media?.payload;
+          const b64: string | undefined = msg.media?.payload;
           if (!b64) break;
           const ok = s.writeMuLaw(b64);
           if (!ok) sessions.delete(streamSid);
           break;
         }
 
+        case "mark": {
+          // optional: handle marks you sent (e.g., "tts_end")
+          break;
+        }
+
         case "stop": {
-          const { streamSid } = msg;
-          console.log("[WS] stop", streamSid);
-          sessions.get(streamSid)?.end();
-          sessions.delete(streamSid);
+          const streamSid: string | undefined = msg.stop?.streamSid ?? msg.streamSid;
+          console.log("[WS] stop", streamSid || "(none)");
+          if (streamSid && sessions.has(streamSid)) {
+            sessions.get(streamSid)?.end();
+            sessions.delete(streamSid);
+          }
           break;
         }
 
