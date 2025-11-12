@@ -2,14 +2,14 @@
 export function twimlHandler() {
     return (req, res) => {
         const xfProto = req.headers["x-forwarded-proto"]?.split(",")[0]?.trim();
-        const proto = xfProto || req.protocol; // מאחורי ngrok יהיה "https"
-        const host = req.headers.host; // <sub>.ngrok-free.dev
+        const proto = xfProto || req.protocol;
+        const host = req.headers.host;
         const wsProto = proto === "https" ? "wss" : "ws";
         const wsUrl = `${wsProto}://${host}/ws/twilio`;
         const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}"/>
+    <Stream url="${wsUrl}" track="inbound_track"/>
   </Connect>
 </Response>`;
         res.type("text/xml").send(xml);

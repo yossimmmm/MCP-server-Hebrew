@@ -51,21 +51,20 @@ export async function speakTextToTwilio(ws, streamSid, text, voiceId) {
     for (let i = 0; i < 50; i++)
         queue.push(Buffer.alloc(160, 0xFF));
     // pace של 20ms
+    // pace של 20ms
+    // inside speakTextToTwilio, in the pacer interval:
     const pacer = setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN)
             return;
-        const frame = queue.shift();
-        if (!frame)
-            return;
+        const frame = queue.length ? queue.shift() : Buffer.alloc(160, 0xFF);
         ws.send(JSON.stringify({
             event: "media",
             streamSid,
-            sequenceNumber: String(++seq),
+            sequenceNumber: String(++seq), // ← important for correct ordering/pace
             media: { payload: frame.toString("base64") },
         }));
-        if ((++sentFrames % 100) === 0) {
+        if ((++sentFrames % 100) === 0)
             console.log(`[TTS→Twilio] sent ${sentFrames} frames`);
-        }
     }, 20);
     // אם ה-WS נסגר באמצע → ננקה משאבים
     const onWsCloseOrError = () => {
