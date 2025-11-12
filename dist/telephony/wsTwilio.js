@@ -1,82 +1,87 @@
-// src/telephony/wsTwilio.ts
-import { WebSocketServer } from "ws";
-import { createGoogleStt } from "../stt/google.js";
-import { speakElevenToTwilio } from "../tts/elevenToTwilio.js";
-export function attachTwilioWs(server) {
-    const wss = new WebSocketServer({ noServer: true });
-    // Upgrade רק לנתיב /ws/twilio
-    server.on("upgrade", (req, socket, head) => {
-        if (!req.url?.startsWith("/ws/twilio"))
-            return;
-        wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-    });
-    wss.on("connection", (ws) => {
-        let streamSid = "";
-        let playing = false; // מנגן כרגע TTS
-        const stt = createGoogleStt({
-            languageCode: "he-IL",
-            sampleRateHertz: 8000,
-            onPartial: (text) => {
-                // בראג'-אין: אם יש דיבור נכנס בזמן ניגון, תנקה תור ניגון
-                if (playing) {
-                    try {
-                        ws.send(JSON.stringify({ event: "clear", streamSid }));
-                    }
-                    catch { }
-                }
-            },
-            onFinal: async (text) => {
-                // פה אתה יכול להחליף בלוגיקה/בוט/DF-CX; כרגע — פשוט מחזיר תשובה
-                if (!text.trim())
-                    return;
-                playing = true;
-                try {
-                    await speakElevenToTwilio({
-                        ws,
-                        streamSid,
-                        text,
-                        voiceId: process.env.ELEVENLABS_VOICE_ID || "",
-                        speed: 1.0,
-                        model: process.env.DEFAULT_MODEL || "eleven_v3",
-                    });
-                    // סימון סיום קטע (לא חובה)
-                    ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } }));
-                }
-                catch (e) {
-                    console.error("TTS stream error:", e);
-                }
-                finally {
-                    playing = false;
-                }
-            },
-            onError: (e) => console.error("STT error:", e),
-            onEnd: () => { }
-        });
-        ws.on("message", (data) => {
-            try {
-                const msg = JSON.parse(String(data));
-                if (msg.event === "start") {
-                    streamSid = msg.start.streamSid;
-                    // התחלת סטרים לזיהוי
-                    stt.start();
-                }
-                else if (msg.event === "media") {
-                    // payload הוא base64 של μ-law 8k מ-Twilio
-                    const buf = Buffer.from(msg.media.payload, "base64");
-                    stt.writeMuLaw(buf);
-                }
-                else if (msg.event === "stop") {
-                    stt.stop();
-                    ws.close();
-                }
-            }
-            catch (e) {
-                console.error("WS parse error:", e);
-            }
-        });
-        ws.on("close", () => {
-            stt.stop();
-        });
-    });
-    console.log("Twilio WS ready on path /ws/twilio");
+import WebSocket, { WebSocketServer } from "ws";
+import { createGoogleSession } from "../stt/google.js";
+import { speakTextToTwilio } from "../tts/elevenToTwilio.js";
+function send(ws, obj) {
+    if (ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify(obj));
 }
+export function attachTwilioWs(server) {
+    const wss = new WebSocketServer({ server, path: "/ws/twilio" });
+    wss.on("connection", (ws) => {
+        console.log("[WS] Twilio connected");
+        const sessions = new Map();
+        let mediaCount = 0;
+        const endAll = () => {
+            for (const s of sessions.values()) {
+                try {
+                    s.end();
+                }
+                catch { }
+            }
+            sessions.clear();
+        };
+        ws.on("message", async (raw) => {
+            let msg;
+            try {
+                msg = JSON.parse(raw.toString());
+            }
+            catch {
+                return;
+            }
+            switch (msg.event) {
+                case "start": {
+                    const streamSid = msg.start?.streamSid ?? msg.streamSid;
+                    if (!streamSid) {
+                        console.error("[WS] start event missing streamSid");
+                        break;
+                    }
+                    console.log("[WS] start", streamSid);
+                    sessions.get(streamSid)?.end();
+                    sessions.set(streamSid, createGoogleSession());
+                    try {
+                        await speakTextToTwilio(ws, streamSid, "היי, השיחה עלתה. תגיד משהו ואני אשמע.");
+                    }
+                    catch (e) {
+                        console.error("TTS->Twilio failed:", e?.message || e);
+                    }
+                    break;
+                }
+                case "media": {
+                    const streamSid = msg.streamSid;
+                    if (!streamSid)
+                        break;
+                    if ((++mediaCount % 50) === 0)
+                        console.log("[WS] inbound media frames:", mediaCount);
+                    const s = sessions.get(streamSid);
+                    if (!s)
+                        break;
+                    const b64 = msg.media?.payload;
+                    if (!b64)
+                        break;
+                    const ok = s.writeMuLaw(b64);
+                    if (!ok)
+                        sessions.delete(streamSid);
+                    break;
+                }
+                case "mark": {
+                    // optional: handle marks you sent (e.g., "tts_end")
+                    break;
+                }
+                case "stop": {
+                    const streamSid = msg.stop?.streamSid ?? msg.streamSid;
+                    console.log("[WS] stop", streamSid || "(none)");
+                    if (streamSid && sessions.has(streamSid)) {
+                        sessions.get(streamSid)?.end();
+                        sessions.delete(streamSid);
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        });
+        ws.on("close", () => { console.log("[WS] closed"); endAll(); });
+        ws.on("error", (e) => { console.error("[WS] error", e?.message || e); endAll(); });
+    });
+}
+//# sourceMappingURL=wsTwilio.js.map

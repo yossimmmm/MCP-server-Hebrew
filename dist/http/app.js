@@ -1,4 +1,4 @@
-// src/http/app.ts
+// src/http/app.ts  (החלף את ראוט /stream/tts שלך בזה)
 import express from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
@@ -11,31 +11,17 @@ export function createHttpApp() {
         try {
             const text = String(req.query.text || "");
             if (!text.trim())
-                return res.status(400).json({ error: "Missing 'text' query param" });
-            const voiceId = req.query.voice_id || process.env.ELEVENLABS_VOICE_ID || "";
-            if (!voiceId)
-                return res.status(400).json({ error: "voice_id required (or set ELEVENLABS_VOICE_ID)" });
-            const model = String(req.query.model || process.env.DEFAULT_MODEL || "eleven_v3");
-            const speed = req.query.speed !== undefined ? Number(req.query.speed) : 1.0;
-            if (Number.isNaN(speed) || speed < 0.5 || speed > 1.5) {
-                return res.status(400).json({ error: "speed must be 0.5–1.5" });
-            }
-            const output_format = String(req.query.output_format || process.env.DEFAULT_OUTPUT_FORMAT || "mp3_44100_128");
-            const apiKey = process.env.ELEVENLABS_API_KEY;
+                return res.status(400).json({ error: "missing text" });
+            const apiKey = process.env.ELEVENLABS_API_KEY || "";
             if (!apiKey)
                 return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
-            // v3: DO NOT send optimize_streaming_latency (causes 400)
-            const qs = new URLSearchParams({ output_format });
+            const voiceId = String(req.query.voice_id || process.env.ELEVENLABS_VOICE_ID || "");
+            if (!voiceId)
+                return res.status(400).json({ error: "voice_id required" });
+            const model = String(req.query.model || process.env.DEFAULT_MODEL || "eleven_v3");
+            const format = String(req.query.output_format || process.env.DEFAULT_OUTPUT_FORMAT || "mp3_44100_128");
+            const qs = new URLSearchParams({ output_format: format, optimize_streaming_latency: "4" });
             const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
-            // Minimal body for v3; add voice_settings only if speed != 1.0
-            const body = {
-                text,
-                model_id: model, // correct field for v3
-                output_format,
-                language_code: "he", // or "he-IL"
-            };
-            if (speed !== 1.0)
-                body.voice_settings = { speed };
             const upstream = await fetch(url, {
                 method: "POST",
                 headers: {
@@ -43,13 +29,18 @@ export function createHttpApp() {
                     "content-type": "application/json",
                     "accept": "audio/mpeg",
                 },
-                body: JSON.stringify(body),
+                body: JSON.stringify({ text, model_id: model }), // v3 נתמך ב-TTS עם model_id=eleven_v3
             });
             if (!upstream.ok || !upstream.body) {
-                const msg = await upstream.text().catch(() => upstream.statusText);
-                return res.status(502).json({ error: "elevenlabs upstream error", status: upstream.status, msg });
+                const body = await upstream.text().catch(() => "");
+                return res.status(upstream.status || 502).json({
+                    upstream_status: upstream.status,
+                    model_tried: model,
+                    voice_id: voiceId,
+                    detail: body || "upstream error (empty body)"
+                });
             }
-            res.setHeader("Content-Type", output_format.startsWith("mp3") ? "audio/mpeg" : "audio/*");
+            res.setHeader("Content-Type", "audio/mpeg");
             res.setHeader("Cache-Control", "no-store");
             Readable.fromWeb(upstream.body).pipe(res);
         }
@@ -60,3 +51,5 @@ export function createHttpApp() {
     });
     return app;
 }
+export default createHttpApp;
+//# sourceMappingURL=app.js.map

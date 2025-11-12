@@ -1,14 +1,17 @@
-export function twimlHandler(publicWsUrl) {
-    // publicWsUrl דוגמה: wss://<domain>/ws/twilio
-    return (_req, res) => {
+export function twimlHandler() {
+    return (req, res) => {
+        const xfProto = req.headers["x-forwarded-proto"]?.split(",")[0]?.trim();
+        const proto = xfProto || req.protocol; // "https" מאחורי ngrok
+        const host = req.headers.host; // <subdomain>.ngrok-free.dev
+        const wsProto = proto === "https" ? "wss" : "ws";
+        const wsUrl = `${wsProto}://${host}/ws/twilio`;
         const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
-    <Stream url="${publicWsUrl}" track="both_tracks"/>
-  </Start>
-  <Pause length="600"/>
+  <Connect>
+    <Stream url="${wsUrl}"/>
+  </Connect>
 </Response>`;
-        res.setHeader("Content-Type", "text/xml");
-        res.send(xml);
+        res.type("text/xml").send(xml);
     };
 }
+//# sourceMappingURL=twiml.js.map

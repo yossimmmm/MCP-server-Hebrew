@@ -1,50 +1,72 @@
-// src/stt/google.ts
-import { SpeechClient } from "@google-cloud/speech";
-export function createGoogleStt(opts) {
-    const client = new SpeechClient();
-    let recognizeStream = null;
-    function start() {
-        if (recognizeStream)
-            return;
-        recognizeStream = client
-            .streamingRecognize({
+import speech from "@google-cloud/speech";
+const { v1p1beta1: speechV1 } = speech;
+const client = new speechV1.SpeechClient();
+export class GoogleSttSession {
+    audioIn;
+    closed = false;
+    constructor() {
+        const request = {
             config: {
-                encoding: "MULAW", // קולט ישירות μ-law מטוויליו
-                sampleRateHertz: opts.sampleRateHertz,
-                languageCode: opts.languageCode,
+                encoding: "LINEAR16",
+                sampleRateHertz: 8000,
+                languageCode: "he-IL",
                 enableAutomaticPunctuation: true,
-                model: "phone_call"
             },
-            interimResults: true
+            interimResults: true,
+        };
+        const recognizeStream = client
+            .streamingRecognize(request)
+            .on("error", (e) => {
+            this.closed = true;
+            console.error("STT stream error:", e?.message || e);
         })
-            .on("error", (e) => opts.onError?.(e))
-            .on("data", (data) => {
-            const alt = data.results?.[0]?.alternatives?.[0];
-            if (!alt?.transcript)
-                return;
-            if (data.results[0].isFinal) {
-                opts.onFinal(alt.transcript);
-            }
-            else {
-                opts.onPartial(alt.transcript);
-            }
-        })
-            .on("end", () => {
-            recognizeStream = null;
-            opts.onEnd?.();
-        });
+            .on("end", () => { this.closed = true; });
+        this.audioIn = recognizeStream;
     }
-    function writeMuLaw(chunk) {
-        if (!recognizeStream)
-            return;
-        recognizeStream.write({ audio_content: chunk });
-    }
-    function stop() {
+    writeMuLaw(b64) {
+        if (!this.audioIn || this.closed)
+            return false;
+        const a = this.audioIn;
+        if (a.destroyed || a.writableEnded || a.writableFinished)
+            return false;
         try {
-            recognizeStream?.end();
+            const ulaw = Buffer.from(b64, "base64");
+            const pcm16 = muLawToLinear16(ulaw);
+            return this.audioIn.write(pcm16);
+        }
+        catch (e) {
+            console.error("STT error in writeMuLaw:", e?.message || e);
+            return false;
+        }
+    }
+    end() {
+        if (this.closed)
+            return;
+        this.closed = true;
+        try {
+            this.audioIn?.end();
         }
         catch { }
-        recognizeStream = null;
+        this.audioIn = null;
     }
-    return { start, writeMuLaw, stop };
 }
+export function createGoogleSession() {
+    return new GoogleSttSession();
+}
+function muLawToLinear16(input) {
+    const out = Buffer.allocUnsafe(input.length * 2);
+    for (let i = 0; i < input.length; i++) {
+        const s = ulawDecodeSample(input[i]);
+        out.writeInt16LE(s, i * 2);
+    }
+    return out;
+}
+function ulawDecodeSample(uVal) {
+    uVal = ~uVal & 0xff;
+    const sign = (uVal & 0x80) ? -1 : 1;
+    const exponent = (uVal >> 4) & 0x07;
+    const mantissa = uVal & 0x0F;
+    const sample = (((mantissa << 3) + 0x84) << exponent) - 0x84;
+    return sign * sample;
+}
+//# sourceMappingURL=google.js.map
