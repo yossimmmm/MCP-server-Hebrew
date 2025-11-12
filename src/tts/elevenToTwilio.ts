@@ -1,12 +1,7 @@
-// src/tts/elevenToTwilio.ts
 import { spawn } from "child_process";
 import WebSocket from "ws";
 import { Readable } from "node:stream";
 
-/**
- * ממיר טקסט לאודיו דרך /stream/tts, משנמך ל-μ-law 8kHz,
- * ושולח לטוויליו כפריימים של 160 בייט עם sequenceNumber.
- */
 export async function speakTextToTwilio(
   ws: WebSocket,
   streamSid: string,
@@ -14,83 +9,70 @@ export async function speakTextToTwilio(
   voiceId?: string
 ): Promise<void> {
   if (!streamSid) throw new Error("Missing streamSid for outbound audio");
-  const base = process.env.PUBLIC_BASE_URL;
-  if (!base) throw new Error("PUBLIC_BASE_URL not set");
 
-  // בונים את ה-URL לשירות ה-TTS שלך שמחזיר MP3 בזרימה
-  const url = new URL("/stream/tts", base);
+  const PORT = Number(process.env.PORT || 8080);
+  const localBase = `http://127.0.0.1:${PORT}`;
+
+  const url = new URL("/stream/tts", localBase);
   url.searchParams.set("text", text);
   url.searchParams.set("output_format", "mp3_44100_128");
   if (voiceId) url.searchParams.set("voice_id", voiceId);
+  url.searchParams.set("model", process.env.DEFAULT_MODEL || "eleven_v3");
 
-  // מביאים סטרים MP3
   const res = await fetch(url.toString());
   if (!res.ok || !res.body) {
-    throw new Error("TTS HTTP " + res.status);
+    const body = await res.text().catch(() => "");
+    throw new Error(`TTS HTTP ${res.status} ${body}`);
   }
 
-  // ממירים MP3 → μ-law 8kHz מונו גולמי באמצעות ffmpeg
   const ff = spawn("ffmpeg", [
-    "-hide_banner",
-    "-loglevel", "error",
-    "-i", "pipe:0",
-    "-acodec", "pcm_mulaw",
-    "-ar", "8000",
-    "-ac", "1",
-    "-f", "mulaw",
-    "pipe:1",
+    "-hide_banner","-loglevel","error",
+    "-i","pipe:0",
+    "-acodec","pcm_mulaw","-ar","8000","-ac","1",
+    "-f","mulaw","pipe:1",
   ]);
 
   ff.on("error", (e) => console.error("[ffmpeg spawn error]", e));
   ff.stdin.on("error", (e) => console.error("[ffmpeg stdin error]", e));
-  ff.stderr.on("data", (d) => console.error("[ffmpeg]", d.toString()));
-
-  // חשוב: המרה מ-ReadableStream של web ל-Node stream
   Readable.fromWeb(res.body as any).pipe(ff.stdin);
 
-  // נצבור שאריות כדי לפרק בדיוק ל-160 בייט
+  // קצבן 20ms → 160 בייט לפריים
   let carry: Buffer = Buffer.alloc(0);
+  const queue: Buffer[] = [];
   let seq = 0;
-  let outFrames = 0;
+  let pacer: NodeJS.Timeout | null = null;
 
-  ff.stdout.on("data", (chunk: Buffer) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-
-    const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
-    let offset = 0;
-
-    // Twilio מצפה ל-20ms פריים = 160 בייט @ 8kHz μ-law
-    while (offset + 160 <= data.length) {
-      const frame = data.subarray(offset, offset + 160);
-      offset += 160;
-
+  const startPacer = () => {
+    if (pacer) return;
+    pacer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) { clearInterval(pacer!); pacer = null; return; }
+      const frame = queue.shift();
+      if (!frame) return;
       ws.send(JSON.stringify({
         event: "media",
         streamSid,
         sequenceNumber: String(++seq),
         media: { payload: frame.toString("base64") },
       }));
+    }, 20);
+  };
 
-      outFrames++;
+  ff.stdout.on("data", (chunk: Buffer) => {
+    const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    let off = 0;
+    while (off + 160 <= data.length) {
+      queue.push(data.subarray(off, off + 160));
+      off += 160;
     }
-
-    // שומרים שארית ל-chunk הבא
-    carry = offset < data.length ? data.subarray(offset) : Buffer.alloc(0);
+    carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
+    startPacer();
   });
 
   await new Promise<void>((resolve) => {
     ff.once("close", () => {
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            event: "mark",
-            streamSid,
-            mark: { name: "tts_end" },
-          }));
-        }
-      } catch {}
-      console.log("[ffmpeg] closed. frames sent:", outFrames);
-      resolve();
+      const drain = setInterval(() => {
+        if (queue.length === 0) { clearInterval(drain); if (pacer) { clearInterval(pacer); pacer = null; } resolve(); }
+      }, 50);
     });
   });
 }

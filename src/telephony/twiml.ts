@@ -1,12 +1,12 @@
 // src/telephony/twiml.ts
 import type { Request, Response } from "express";
 
+/** TwiML handler – מחזיר Stream עם WSS לפי ה־Host/Proto של הבקשה (ngrok) */
 export function twimlHandler() {
   return (req: Request, res: Response) => {
     const xfProto = (req.headers["x-forwarded-proto"] as string)?.split(",")[0]?.trim();
-    const proto = xfProto || req.protocol; // "https" מאחורי ngrok
-    const host  = req.headers.host;        // <subdomain>.ngrok-free.dev
-
+    const proto = xfProto || req.protocol;           // מאחורי ngrok יהיה "https"
+    const host  = req.headers.host!;                 // <sub>.ngrok-free.dev
     const wsProto = proto === "https" ? "wss" : "ws";
     const wsUrl = `${wsProto}://${host}/ws/twilio`;
 
@@ -17,7 +17,9 @@ export function twimlHandler() {
     <Stream url="${wsUrl}"/>
   </Connect>
 </Response>`;
-
     res.type("text/xml").send(xml);
   };
 }
+
+// נוח גם כ־default (כדי שלא תיפול על סוג ייבוא)
+export default twimlHandler;

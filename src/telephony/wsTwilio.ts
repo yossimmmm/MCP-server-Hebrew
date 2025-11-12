@@ -25,20 +25,26 @@ export function attachTwilioWs(server: any) {
 
       switch (msg.event) {
         case "start": {
-          const streamSid: string | undefined = msg.start?.streamSid ?? msg.streamSid;
-          if (!streamSid) { console.error("[WS] start event missing streamSid"); break; }
-          console.log("[WS] start", streamSid);
+  const streamSid: string | undefined = msg.start?.streamSid ?? msg.streamSid;
+  if (!streamSid) { console.error("[WS] start event missing streamSid"); break; }
+  console.log("[WS] start", streamSid);
 
-          sessions.get(streamSid)?.end();
-          sessions.set(streamSid, createGoogleSession());
+  sessions.get(streamSid)?.end();
 
-          try {
-            await speakTextToTwilio(ws, streamSid, "היי, השיחה עלתה. תגיד משהו ואני אשמע.");
-          } catch (e: any) {
-            console.error("TTS->Twilio failed:", e?.message || e);
-          }
-          break;
-        }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    sessions.set(streamSid, createGoogleSession());
+  } else {
+    console.warn("STT disabled: GOOGLE_APPLICATION_CREDENTIALS missing");
+  }
+
+  try {
+    await speakTextToTwilio(ws, streamSid, "היי, השיחה עלתה. תגיד משהו ואני אשמע.");
+  } catch (e: any) {
+    console.error("TTS->Twilio failed:", e?.message || e);
+  }
+  break;
+}
+
 
         case "media": {
           const streamSid: string | undefined = msg.streamSid;
