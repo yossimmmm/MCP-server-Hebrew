@@ -61,18 +61,29 @@ export class GoogleSttSession {
 
   // EOU logic
   private eouMs = Number(process.env.STT_EOU_MS || "750");
+  private eouGuardMs = Number(process.env.STT_EOU_GUARD_MS || "500");
+  private minPartialChars = Number(process.env.STT_MIN_PARTIAL_CHARS || "3");
   private lastPartial = "";
   private lastPartialAt = 0;
   private eouTimer: NodeJS.Timeout | null = null;
+  private lastGoogleFinalAt = 0;
 
   private scheduleEOU = () => {
     if (!this.eouMs) return;
     if (this.eouTimer) clearTimeout(this.eouTimer);
-    if (!this.lastPartial) return;
+    if (!this.lastPartial || this.lastPartial.replace(/\s/g, "").length < this.minPartialChars) {
+      return;
+    }
 
     this.eouTimer = setTimeout(() => {
       const t = this.lastPartial;
       this.lastPartial = "";
+
+      // Drop EOU if a Google final just arrived (race guard)
+      if (Date.now() - this.lastGoogleFinalAt < this.eouGuardMs) {
+        console.log("[STT final eou] suppressed (recent Google final)");
+        return;
+      }
       if (t && this.acceptFinal(t)) {
         this.cb.onFinal?.(t);
         console.log("[STT final eou]", t);
@@ -96,11 +107,19 @@ export class GoogleSttSession {
     const languageCode = process.env.STT_LANGUAGE_CODE || "he-IL";
 
     // Optional model tuning/envs (safe defaults)
-    const enablePunc = String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
-    const useEnhanced = String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
+    const enablePunc =
+      String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
+    const useEnhanced =
+      String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
     const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
     const speechContexts = process.env.STT_HINTS
-      ? [{ phrases: process.env.STT_HINTS.split("|").map(s => s.trim()).filter(Boolean) }]
+      ? [
+          {
+            phrases: process.env.STT_HINTS.split("|")
+              .map((s) => s.trim())
+              .filter(Boolean),
+          },
+        ]
       : undefined;
 
     const request = {
@@ -110,8 +129,8 @@ export class GoogleSttSession {
         languageCode,
         enableAutomaticPunctuation: enablePunc,
         useEnhanced,
-        model,              // only used if provided
-        speechContexts,     // lightweight biasing
+        model, // only used if provided
+        speechContexts, // lightweight biasing
         audioChannelCount: 1,
       },
       interimResults: true,
@@ -163,6 +182,7 @@ export class GoogleSttSession {
               if (r.isFinal) {
                 const t = alt.transcript;
                 this.clearEOU();
+                this.lastGoogleFinalAt = Date.now();
                 if (this.acceptFinal(t)) {
                   this.cb.onFinal?.(t);
                   console.log("[STT final]", t);

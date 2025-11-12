@@ -1,72 +1,87 @@
-import { v2 as speechV2 } from "@google-cloud/speech";
-import { Buffer } from "node:buffer";
-const client = new speechV2.SpeechClient();
-// μ-law → PCM16 conversion (table-based, fast enough for telephony)
-const MU_LAW_EXP_TABLE = (() => {
-    const table = new Int16Array(256);
-    const BIAS = 0x84;
-    for (let i = 0; i < 256; i++) {
-        const u = ~i & 0xff;
-        let t = ((u & 0x0f) << 3) + BIAS;
-        t <<= ((u & 0x70) >> 4) + 2;
-        table[i] = (u & 0x80) ? (BIAS - t) : (t - BIAS);
-    }
-    return table;
-})();
-export function mulawToPcm16(mulaw) {
-    const out = Buffer.allocUnsafe(mulaw.length * 2);
-    for (let i = 0; i < mulaw.length; i++) {
-        const s = MU_LAW_EXP_TABLE[mulaw[i]];
-        out.writeInt16LE(s, i * 2);
-    }
-    return out;
-}
-export function createHebrewChirp3Stream(recognizerPath, // "projects/<PROJECT>/locations/global/recognizers/hebrew-reco"
-handlers = {}) {
-    const stream = client.streamingRecognize();
-    stream.on("data", (resp) => {
+import { v2 as speech } from "@google-cloud/speech";
+export function createHebrewChirp3Stream(recognizer, opts) {
+    const { apiEndpoint, languageCode = "he-IL", model = "chirp", interimResults = true, onData, onError, onEnd, } = opts;
+    const client = new speech.SpeechClient(apiEndpoint ? { apiEndpoint } : undefined);
+    // v2 requires: first write is streamingConfig; subsequent writes send { audio: Buffer }
+    // Use explicitDecodingConfig for Twilio μ-law (8000 Hz, mono).
+    const streamingConfig = {
+        config: {
+            languageCodes: [languageCode],
+            model,
+            // Choose explicit decoding for raw headerless audio:
+            explicitDecodingConfig: {
+                encoding: "MULAW",
+                sampleRateHertz: 8000,
+                audioChannelCount: 1,
+            },
+            // Enable punctuation (safe default). You can expose via env if you want.
+            features: {
+                enableAutomaticPunctuation: true,
+            },
+        },
+        streamingFeatures: {
+            interimResults,
+            // singleUtterance: false (default) → continuous stream; we handle EOU in higher layer
+        },
+    };
+    let destroyed = false;
+    const recognizeStream = client
+        // Using the private streaming method works reliably with v2 per community reports.
+        // See discussion: https://stackoverflow.com/q/76722471
+        ._streamingRecognize()
+        .on("data", (resp) => {
         try {
-            const results = resp?.results ?? [];
-            for (const r of results) {
-                const alt = r?.alternatives?.[0];
-                if (!alt)
+            if (!resp?.results?.length)
+                return;
+            for (const r of resp.results) {
+                const alt = r.alternatives?.[0];
+                if (!alt?.transcript)
                     continue;
-                const text = String(alt.transcript ?? "");
-                const isFinal = Boolean(r.isFinal ?? r?.result?.isFinal);
-                handlers.onData?.(text, isFinal, resp);
+                onData(alt.transcript, !!r.isFinal);
             }
         }
         catch (e) {
-            handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
+            onError?.(e instanceof Error ? e : new Error(String(e)));
         }
+    })
+        .on("error", (err) => {
+        destroyed = true;
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+    })
+        .on("end", () => {
+        destroyed = true;
+        onEnd?.();
     });
-    stream.on("error", (e) => handlers.onError?.(e instanceof Error ? e : new Error(String(e))));
-    stream.on("end", () => handlers.onEnd?.());
-    // Initial config packet
-    stream.write({
-        recognizer: recognizerPath,
-        config: {
-            autoDecodingConfig: {}, // we're sending PCM16 8k after μ-law decode
-            features: { enableAutomaticPunctuation: true },
-            model: "chirp_3",
-            languageCodes: ["he-IL"],
-            // singleUtterance: false
-        },
+    // Send the initial config write
+    recognizeStream.write({
+        recognizer,
+        streamingConfig,
     });
-    return {
-        writeMuLawBase64: (b64) => {
+    function writeMuLawBase64(b64) {
+        if (destroyed)
+            return;
+        try {
+            const ulaw = Buffer.from(b64, "base64");
+            // Send raw μ-law bytes; v2 will decode per explicitDecodingConfig
+            recognizeStream.write({ audio: ulaw });
+        }
+        catch (e) {
+            destroyed = true;
+            onError?.(e instanceof Error ? e : new Error(String(e)));
             try {
-                const mulaw = Buffer.from(b64, "base64");
-                const pcm16 = mulawToPcm16(mulaw);
-                // Some lib versions expect {audioPacket:{data}}, others {audio:{content}}
-                stream.write({ audioPacket: { data: pcm16 } });
-                // If you see "Unrecognized field audioPacket", switch to:
-                // stream.write({ audio: { content: pcm16 } } as any);
+                recognizeStream.end();
             }
-            catch (e) {
-                handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
-            }
-        },
-        end: () => stream.end(),
-    };
+            catch { }
+        }
+    }
+    function end() {
+        if (destroyed)
+            return;
+        destroyed = true;
+        try {
+            recognizeStream.end();
+        }
+        catch { }
+    }
+    return { writeMuLawBase64, end };
 }

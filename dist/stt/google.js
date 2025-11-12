@@ -45,19 +45,28 @@ export class GoogleSttSession {
     acceptFinal;
     // EOU logic
     eouMs = Number(process.env.STT_EOU_MS || "750");
+    eouGuardMs = Number(process.env.STT_EOU_GUARD_MS || "500");
+    minPartialChars = Number(process.env.STT_MIN_PARTIAL_CHARS || "3");
     lastPartial = "";
     lastPartialAt = 0;
     eouTimer = null;
+    lastGoogleFinalAt = 0;
     scheduleEOU = () => {
         if (!this.eouMs)
             return;
         if (this.eouTimer)
             clearTimeout(this.eouTimer);
-        if (!this.lastPartial)
+        if (!this.lastPartial || this.lastPartial.replace(/\s/g, "").length < this.minPartialChars) {
             return;
+        }
         this.eouTimer = setTimeout(() => {
             const t = this.lastPartial;
             this.lastPartial = "";
+            // Drop EOU if a Google final just arrived (race guard)
+            if (Date.now() - this.lastGoogleFinalAt < this.eouGuardMs) {
+                console.log("[STT final eou] suppressed (recent Google final)");
+                return;
+            }
             if (t && this.acceptFinal(t)) {
                 this.cb.onFinal?.(t);
                 console.log("[STT final eou]", t);
@@ -82,7 +91,13 @@ export class GoogleSttSession {
         const useEnhanced = String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
         const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
         const speechContexts = process.env.STT_HINTS
-            ? [{ phrases: process.env.STT_HINTS.split("|").map(s => s.trim()).filter(Boolean) }]
+            ? [
+                {
+                    phrases: process.env.STT_HINTS.split("|")
+                        .map((s) => s.trim())
+                        .filter(Boolean),
+                },
+            ]
             : undefined;
         const request = {
             config: {
@@ -141,6 +156,7 @@ export class GoogleSttSession {
                         if (r.isFinal) {
                             const t = alt.transcript;
                             this.clearEOU();
+                            this.lastGoogleFinalAt = Date.now();
                             if (this.acceptFinal(t)) {
                                 this.cb.onFinal?.(t);
                                 console.log("[STT final]", t);

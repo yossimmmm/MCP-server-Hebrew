@@ -1,14 +1,29 @@
 import { WebSocketServer } from "ws";
 import speakTextToTwilio from "../tts/elevenToTwilio.js";
 import { createGoogleSession } from "../stt/google.js";
+import { createHebrewChirp3Stream } from "../stt/googleChirpV2.js";
 import { LlmSession } from "../nlu/gemini.js";
 const BARGE_IN_MIN_CHARS = Number(process.env.BARGE_IN_MIN_CHARS || "5");
-const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10"); // ↑ safer default
-const PACER_MS = Number(process.env.PACER_MS || "20");
+const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10");
+const PACER_MS = Number(process.env.TTS_PACER_MS || process.env.PACER_MS || "20");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "eleven_v3";
 const DEFAULT_LANG = process.env.TTS_LANGUAGE_CODE || "he";
 const CALL_GREETING = process.env.CALL_GREETING || "";
 const LLM_TRIGGER_DEBOUNCE_MS = Number(process.env.LLM_TRIGGER_DEBOUNCE_MS || "220");
+// STT engine selector; default to v1 unless recognizer is provided
+const STT_ENGINE = String(process.env.STT_ENGINE || "").toLowerCase(); // "v1" | "v2"
+const V2_RECOGNIZER = process.env.GC_STT_RECOGNIZER || ""; // projects/{proj}/locations/{loc}/recognizers/{id or _}
+const V2_API_ENDPOINT = process.env.GC_STT_API_ENDPOINT || deriveEndpointFromRecognizer(V2_RECOGNIZER);
+function deriveEndpointFromRecognizer(recognizer) {
+    const m = recognizer.match(/\/locations\/([^/]+)/i);
+    const loc = m?.[1];
+    if (!loc || loc.toLowerCase() === "global") {
+        // Default global API endpoint works for default recognizer "_" and non-Chirp models
+        return undefined; // use library default "speech.googleapis.com"
+    }
+    // For Chirp in specific regions use region endpoint, e.g. "us-central1-speech.googleapis.com"
+    return `${loc}-speech.googleapis.com`;
+}
 // Map XI_* env into voice settings (with safe snapping for v3)
 function envVoiceSettings() {
     const num = (k) => (process.env[k] != null ? Number(process.env[k]) : undefined);
@@ -33,7 +48,9 @@ function envVoiceSettings() {
         vs.speaking_rate = Math.max(0.5, Math.min(2, rate));
     return Object.keys(vs).length ? vs : undefined;
 }
-function now() { return new Date().toISOString(); }
+function now() {
+    return new Date().toISOString();
+}
 export function attachTwilioWs(server) {
     const wss = new WebSocketServer({ server, path: "/ws/twilio" });
     wss.on("connection", (ws, req) => {
@@ -49,7 +66,6 @@ export function attachTwilioWs(server) {
         let replyTimer = null;
         let pendingText = null;
         const speak = async (text) => {
-            // Hard stop any ongoing TTS before starting a new one
             try {
                 ttsAbort?.abort();
             }
@@ -75,32 +91,101 @@ export function attachTwilioWs(server) {
                 ttsAbort = undefined;
             }
         };
-        const stt = createGoogleSession({
-            onPartial: (txt) => {
-                // Barge-in: cancel TTS when user starts saying something substantive
-                if (txt.replace(/\s/g, "").length >= BARGE_IN_MIN_CHARS) {
-                    try {
-                        ttsAbort?.abort();
+        // Install STT (v2 with fallback to v1 on any error)
+        let sttWrite = () => { };
+        let sttEnd = () => { };
+        let sttDead = false;
+        const installV1 = (why) => {
+            if (why)
+                console.warn(`[STT] Switching to v1 because: ${why}`);
+            const sttV1 = createGoogleSession({
+                onPartial: (txt) => {
+                    if (txt.replace(/\s/g, "").length >= BARGE_IN_MIN_CHARS) {
+                        try {
+                            ttsAbort?.abort();
+                        }
+                        catch { }
+                        ttsAbort = undefined;
                     }
-                    catch { }
-                    ttsAbort = undefined;
-                }
-            },
-            onFinal: (finalText) => {
-                // Debounce multiple close-together finals into one agent turn
-                pendingText = finalText;
-                if (replyTimer)
-                    clearTimeout(replyTimer);
-                replyTimer = setTimeout(async () => {
-                    const text = pendingText;
-                    pendingText = null;
-                    const reply = await llm.reply(text);
-                    if (!streamSid)
+                },
+                onFinal: (finalText) => {
+                    pendingText = finalText;
+                    if (replyTimer)
+                        clearTimeout(replyTimer);
+                    replyTimer = setTimeout(async () => {
+                        const text = pendingText;
+                        pendingText = null;
+                        const reply = await llm.reply(text);
+                        if (!streamSid)
+                            return;
+                        await speak(reply);
+                    }, LLM_TRIGGER_DEBOUNCE_MS);
+                },
+            });
+            sttWrite = (b64) => {
+                if (!sttDead)
+                    sttV1.writeMuLaw(b64);
+            };
+            sttEnd = () => sttV1.end();
+        };
+        const installV2 = () => {
+            if (!V2_RECOGNIZER || !/^projects\/[^/]+\/locations\/[^/]+\/recognizers\/[^/]+$/i.test(V2_RECOGNIZER)) {
+                installV1("invalid or missing GC_STT_RECOGNIZER");
+                return;
+            }
+            const sttV2 = createHebrewChirp3Stream(V2_RECOGNIZER, {
+                apiEndpoint: V2_API_ENDPOINT, // may be undefined → library default
+                languageCode: process.env.STT_LANGUAGE_CODE || "he-IL",
+                model: process.env.GC_STT_MODEL || "chirp",
+                interimResults: true,
+                onData: (text, isFinal) => {
+                    if (!text)
                         return;
-                    await speak(reply);
-                }, LLM_TRIGGER_DEBOUNCE_MS);
-            },
-        });
+                    if (isFinal) {
+                        pendingText = text;
+                        if (replyTimer)
+                            clearTimeout(replyTimer);
+                        replyTimer = setTimeout(async () => {
+                            const t = pendingText;
+                            pendingText = null;
+                            const reply = await llm.reply(t);
+                            if (!streamSid)
+                                return;
+                            await speak(reply);
+                        }, LLM_TRIGGER_DEBOUNCE_MS);
+                    }
+                    else {
+                        if (text.replace(/\s/g, "").length >= BARGE_IN_MIN_CHARS) {
+                            try {
+                                ttsAbort?.abort();
+                            }
+                            catch { }
+                            ttsAbort = undefined;
+                        }
+                    }
+                },
+                onError: (e) => {
+                    console.error("[STT v2 error]", e?.message || e);
+                    sttDead = true;
+                    installV1(e?.message || "v2 stream error");
+                },
+                onEnd: () => {
+                    sttDead = true;
+                },
+            });
+            sttWrite = (b64) => {
+                if (!sttDead)
+                    sttV2.writeMuLawBase64(b64);
+            };
+            sttEnd = () => sttV2.end();
+        };
+        // Choose engine: v2 only if explicitly selected and recognizer present
+        if (STT_ENGINE === "v2" && V2_RECOGNIZER) {
+            installV2();
+        }
+        else {
+            installV1(!V2_RECOGNIZER && STT_ENGINE === "v2" ? "GC_STT_RECOGNIZER not set" : undefined);
+        }
         ws.on("message", async (data) => {
             try {
                 const msg = JSON.parse(String(data));
@@ -118,7 +203,7 @@ export function attachTwilioWs(server) {
                         break;
                     case "media":
                         if (msg.media?.payload)
-                            stt.writeMuLaw(msg.media.payload);
+                            sttWrite(msg.media.payload);
                         break;
                     case "stop":
                         console.log(`[twilio] stop streamSid=${msg.streamSid || streamSid}`);
@@ -132,8 +217,14 @@ export function attachTwilioWs(server) {
                 console.error("[twilio][ws] message error:", e?.message || e);
             }
         });
-        ws.on("close", () => { console.log("[twilio][ws] closed"); cleanup(); });
-        ws.on("error", (err) => { console.error("[twilio][ws] error:", err?.message || err); cleanup(); });
+        ws.on("close", () => {
+            console.log("[twilio][ws] closed");
+            cleanup();
+        });
+        ws.on("error", (err) => {
+            console.error("[twilio][ws] error:", err?.message || err);
+            cleanup();
+        });
         function cleanup() {
             if (closed)
                 return;
@@ -143,7 +234,7 @@ export function attachTwilioWs(server) {
             }
             catch { }
             try {
-                stt?.end();
+                sttEnd?.();
             }
             catch { }
         }
