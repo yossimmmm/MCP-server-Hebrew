@@ -1,33 +1,92 @@
-import speech from "@google-cloud/speech";
-const { v1p1beta1: speechV1 } = speech;
-const client = new speechV1.SpeechClient();
+// src/stt/google.ts
+import fs from "fs";
+import { SpeechClient } from "@google-cloud/speech";
+/** ייצור לקוח עם קרדנטים מהקובץ, כולל תיקון \n במפתח */
+function makeSpeechClient() {
+    const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (credPath && fs.existsSync(credPath)) {
+        try {
+            const raw = fs.readFileSync(credPath, "utf8");
+            const j = JSON.parse(raw);
+            const private_key = String(j.private_key || "").replace(/\\n/g, "\n");
+            const client_email = String(j.client_email || "");
+            const projectId = String(j.project_id || "");
+            if (!private_key || !client_email) {
+                console.warn("[STT] missing private_key/client_email in creds JSON, falling back to ADC");
+                return new SpeechClient();
+            }
+            return new SpeechClient({
+                projectId,
+                credentials: { client_email, private_key },
+            });
+        }
+        catch (e) {
+            console.error("[STT] failed reading creds JSON, falling back to ADC:", e?.message || e);
+            return new SpeechClient();
+        }
+    }
+    // ADC (metadata server / gcloud auth application-default login)
+    return new SpeechClient();
+}
 export class GoogleSttSession {
-    audioIn;
+    client;
+    audioIn = null;
     closed = false;
-    constructor() {
+    cb;
+    constructor(cb = {}) {
+        this.cb = cb;
+        this.client = makeSpeechClient();
+        const languageCode = process.env.STT_LANGUAGE_CODE || "he-IL";
         const request = {
             config: {
                 encoding: "LINEAR16",
                 sampleRateHertz: 8000,
-                languageCode: "he-IL",
+                languageCode,
                 enableAutomaticPunctuation: true,
             },
             interimResults: true,
         };
-        const recognizeStream = client
+        const recognizeStream = this.client
             .streamingRecognize(request)
             .on("error", (e) => {
             this.closed = true;
             console.error("STT stream error:", e?.message || e);
         })
-            .on("end", () => { this.closed = true; });
+            .on("end", () => {
+            this.closed = true;
+            // console.log("[STT] stream ended");
+        })
+            .on("data", (data) => {
+            try {
+                if (!data || !data.results || !data.results.length)
+                    return;
+                for (const r of data.results) {
+                    const alt = r.alternatives?.[0];
+                    if (!alt?.transcript)
+                        continue;
+                    if (r.isFinal) {
+                        this.cb.onFinal?.(alt.transcript);
+                        // console.log("[STT final]", alt.transcript);
+                    }
+                    else {
+                        this.cb.onPartial?.(alt.transcript);
+                        // console.log("[STT partial]", alt.transcript);
+                    }
+                }
+            }
+            catch (err) {
+                console.error("STT data handler error:", err?.message || err);
+            }
+        });
         this.audioIn = recognizeStream;
+        // console.log("[STT] streaming session opened (he-IL, 8kHz, LINEAR16)");
     }
+    /** ממשק הישן: קלט μ-law ב-base64 → המרה ל-PCM16 8kHz ושליחה לגוגל */
     writeMuLaw(b64) {
         if (!this.audioIn || this.closed)
             return false;
-        const a = this.audioIn;
-        if (a.destroyed || a.writableEnded || a.writableFinished)
+        const s = this.audioIn;
+        if (s.destroyed || s.writableEnded || s.writableFinished)
             return false;
         try {
             const ulaw = Buffer.from(b64, "base64");
@@ -50,13 +109,14 @@ export class GoogleSttSession {
         this.audioIn = null;
     }
 }
-export function createGoogleSession() {
-    return new GoogleSttSession();
+export function createGoogleSession(cb) {
+    return new GoogleSttSession(cb);
 }
+/** μ-law → PCM16LE (8kHz) */
 function muLawToLinear16(input) {
     const out = Buffer.allocUnsafe(input.length * 2);
     for (let i = 0; i < input.length; i++) {
-        const s = ulawDecodeSample(input[i]);
+        const s = ulawDecodeSample(input[i] & 0xff);
         out.writeInt16LE(s, i * 2);
     }
     return out;
