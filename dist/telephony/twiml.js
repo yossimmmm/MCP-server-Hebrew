@@ -17,4 +17,3 @@ export function twimlHandler() {
 }
 // נוח גם כ־default (כדי שלא תיפול על סוג ייבוא)
 export default twimlHandler;
-//# sourceMappingURL=twiml.js.map

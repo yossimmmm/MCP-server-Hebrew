@@ -29,4 +29,3 @@ export class FramePacer {
     stop() { if (this.timer)
         clearInterval(this.timer); this.timer = undefined; }
 }
-//# sourceMappingURL=framePacer.js.map

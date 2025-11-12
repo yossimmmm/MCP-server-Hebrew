@@ -74,4 +74,3 @@ export function attachMcp(app, appBaseUrl) {
     });
     return { endpoint: `${appBaseUrl}/mcp` };
 }
-//# sourceMappingURL=server.js.map

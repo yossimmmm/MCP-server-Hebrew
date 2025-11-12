@@ -24,40 +24,45 @@ export function createHttpApp() {
             const model = String(req.query.model || process.env.DEFAULT_MODEL || "eleven_v3");
             const output_format = String(req.query.output_format ||
                 process.env.DEFAULT_OUTPUT_FORMAT ||
-                "mp3_44100_128");
+                "ulaw_8000" // ← default for phone
+            );
+            const language_code = String(req.query.language_code || "he");
+            // Optional per-request voice tuning
+            const voice_settings = req.query.voice_settings
+                ? JSON.parse(String(req.query.voice_settings))
+                : undefined;
             const apiKey = process.env.ELEVENLABS_API_KEY;
             if (!apiKey) {
                 return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
             }
-            // Build querystring for ElevenLabs stream endpoint
             const qs = new URLSearchParams();
             qs.set("output_format", output_format);
-            // v3 לא תומך ב-optimize_streaming_latency — נאפשר רק אם זה *לא* v3
+            // Don't set optimize_streaming_latency for v3
             const optLat = req.query.optimize_streaming_latency ??
                 process.env.OPTIMIZE_STREAMING_LATENCY;
             if (!model.startsWith("eleven_v3") && optLat != null) {
                 qs.set("optimize_streaming_latency", String(optLat));
             }
             const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
-            // --- Debug logs (ללא הדפסת הטקסט עצמו) ---
             console.log("[TTS upstream] POST", url, "model:", model);
             const body = {
                 text,
                 model_id: model,
-                // אל תשלח voice_settings/speed ל-v3 אם לא חייבים
+                language_code,
             };
+            if (voice_settings)
+                body.voice_settings = voice_settings;
             const upstream = await fetch(url, {
                 method: "POST",
                 headers: {
                     "xi-api-key": apiKey,
                     "content-type": "application/json",
-                    accept: "audio/mpeg",
+                    accept: "*/*", // allow ulaw/pcm/mp3
                 },
                 body: JSON.stringify(body),
             });
             const ct = upstream.headers.get("content-type") || "";
             console.log(`[TTS upstream] status=${upstream.status} content-type=${ct}`);
-            // אם ה-upstream נכשל או אין body → החזר 502 עם פירוט
             if (!upstream.ok || !upstream.body) {
                 const msg = await upstream.text().catch(() => upstream.statusText);
                 console.error(`[TTS upstream] ERROR ${upstream.status}: ${msg}`);
@@ -69,21 +74,8 @@ export function createHttpApp() {
                     msg,
                 });
             }
-            // אם לא קיבלנו אודיו אמיתי → החזר 502 עם דוגמית טקסט לתחקור
-            if (!ct.includes("audio/mpeg")) {
-                const preview = await upstream.text().catch(() => "");
-                console.error(`[TTS upstream] Non-audio response (${ct}): ${preview.slice(0, 500)}`);
-                return res.status(502).json({
-                    error: "elevenlabs non-audio",
-                    upstream_status: upstream.status,
-                    model_tried: model,
-                    voice_id: voiceId,
-                    ct,
-                    msg: preview.slice(0, 500),
-                });
-            }
-            // Pass-through של ה-MP3 החי
-            res.setHeader("Content-Type", "audio/mpeg");
+            // Pass-through regardless of content-type
+            res.setHeader("Content-Type", ct || "application/octet-stream");
             res.setHeader("Cache-Control", "no-store");
             Readable.fromWeb(upstream.body).pipe(res);
         }
@@ -97,4 +89,3 @@ export function createHttpApp() {
     return app;
 }
 export default createHttpApp;
-//# sourceMappingURL=app.js.map

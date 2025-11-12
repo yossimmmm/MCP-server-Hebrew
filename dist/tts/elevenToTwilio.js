@@ -1,116 +1,184 @@
 // src/tts/elevenToTwilio.ts
-import { spawn } from "child_process";
 import WebSocket from "ws";
-import { Readable } from "node:stream";
+import { performance } from "node:perf_hooks";
+const XI_API = "https://api.elevenlabs.io/v1";
+function nextTick(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
 /**
- * ממיר טקסט לאודיו דרך /stream/tts, משנמך ל-μ-law 8kHz מונו,
- * ושולח ל-Twilio בפריימים של 160 בייט (20ms).
+ * Streams Hebrew TTS as μ-law 8kHz directly from ElevenLabs and feeds Twilio as 20ms frames (160 bytes).
+ * Supports barge-in via AbortSignal.
  */
-export async function speakTextToTwilio(ws, streamSid, text, voiceId) {
+export async function speakTextToTwilio(ws, streamSid, text, opts = {}) {
     if (!streamSid)
         throw new Error("Missing streamSid");
-    // נשתמש בלופבאק מקומי כדי לא להיתקע על PUBLIC_BASE_URL פנימי/חיצוני
-    const PORT = Number(process.env.PORT || 8080);
-    const localBase = `http://127.0.0.1:${PORT}`;
-    const url = new URL("/stream/tts", localBase);
-    url.searchParams.set("text", text);
-    url.searchParams.set("output_format", "mp3_44100_128");
-    url.searchParams.set("model", process.env.DEFAULT_MODEL || "eleven_v3");
-    if (voiceId)
-        url.searchParams.set("voice_id", voiceId);
-    // לוג דיבאג בלי לחשוף טקסט:
-    console.log(`[TTS] → ${url.toString().replace(/text=[^&]*/, 'text=***')} model:${process.env.DEFAULT_MODEL || "eleven_v3"}`);
-    const res = await fetch(url.toString());
-    if (!res.ok || !res.body) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`TTS HTTP ${res.status} ${body}`);
+    const { voiceId = process.env.ELEVENLABS_VOICE_ID || "", modelId = process.env.DEFAULT_MODEL || "eleven_v3", startBufferFrames = 12, pacerMs = 20, signal, voiceSettings, language_code = "he", } = opts;
+    if (!voiceId)
+        throw new Error("voiceId required (set ELEVENLABS_VOICE_ID)");
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey)
+        throw new Error("ELEVENLABS_API_KEY not set");
+    // Build ElevenLabs streaming URL for μ-law at 8kHz (telephony-native)
+    const qs = new URLSearchParams();
+    qs.set("output_format", "ulaw_8000"); // native Twilio format
+    const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
+    // Prepare request body
+    const body = {
+        text,
+        model_id: modelId,
+        language_code,
+    };
+    if (voiceSettings)
+        body.voice_settings = voiceSettings;
+    console.log(`[TTS] POST XI stream ulaw_8000 model=${modelId} voice=${voiceId} text=***`);
+    const ctrl = new AbortController();
+    const onAbort = () => ctrl.abort();
+    if (signal) {
+        if (signal.aborted)
+            return "canceled";
+        signal.addEventListener("abort", onAbort, { once: true });
     }
-    // mp3 → μ-law 8kHz mono raw
-    const ff = spawn("ffmpeg", [
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", "pipe:0",
-        "-acodec", "pcm_mulaw",
-        "-ar", "8000",
-        "-ac", "1",
-        "-f", "mulaw",
-        "pipe:1",
-    ]);
-    ff.on("error", (e) => console.error("[ffmpeg spawn error]", e));
-    ff.stdin.on("error", (e) => console.error("[ffmpeg stdin error]", e));
-    ff.stderr.on("data", (d) => console.error("[ffmpeg]", d.toString()));
-    // חיבור הזרם הנכנס מ-/stream/tts ל-ffmpeg
-    Readable.fromWeb(res.body).pipe(ff.stdin);
-    // תור פריימים ל־20ms pace
+    let canceled = false;
+    const cleanupAbort = () => {
+        if (signal)
+            signal.removeEventListener("abort", onAbort);
+    };
+    let res = null;
+    try {
+        res = await fetch(url, {
+            method: "POST",
+            headers: {
+                "xi-api-key": apiKey,
+                "content-type": "application/json",
+                accept: "*/*",
+            },
+            body: JSON.stringify(body),
+            signal: ctrl.signal,
+        });
+    }
+    catch (e) {
+        cleanupAbort();
+        if (e?.name === "AbortError")
+            return "canceled";
+        throw e;
+    }
+    const ct = res.headers.get("content-type") || "";
+    console.log(`[TTS upstream] status=${res.status} ct=${ct}`);
+    if (!res.ok || !res.body) {
+        cleanupAbort();
+        const msg = await res.text().catch(() => res.statusText);
+        throw new Error(`ElevenLabs upstream error ${res.status}: ${msg}`);
+    }
+    // Jitter buffer: gather 160-byte μ-law frames
     const queue = [];
-    let carry = Buffer.alloc(0); // ← בלי Generic! רק Buffer
+    let carry = Buffer.alloc(0); // IMPORTANT: no generic annotation
     let seq = 0;
     let sentFrames = 0;
-    const MAX_QUEUE = 500; // הגבלת זיכרון סבירה
-    // שקט פתיחה 1s (50 פריימים של 0xFF)
-    for (let i = 0; i < 50; i++)
-        queue.push(Buffer.alloc(160, 0xFF));
-    // pace של 20ms
-    // pace של 20ms
-    // inside speakTextToTwilio, in the pacer interval:
-    const pacer = setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN)
+    // Start pacer when we have a little buffer
+    let pacing = false;
+    let pacerTimer;
+    let t0 = performance.now();
+    let tick = 0;
+    const startPacer = () => {
+        if (pacing)
             return;
-        const frame = queue.length ? queue.shift() : Buffer.alloc(160, 0xFF);
-        ws.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            sequenceNumber: String(++seq), // ← important for correct ordering/pace
-            media: { payload: frame.toString("base64") },
-        }));
-        if ((++sentFrames % 100) === 0)
-            console.log(`[TTS→Twilio] sent ${sentFrames} frames`);
-    }, 20);
-    // אם ה-WS נסגר באמצע → ננקה משאבים
-    const onWsCloseOrError = () => {
-        try {
-            clearInterval(pacer);
-        }
-        catch { }
-        try {
-            ff.kill("SIGKILL");
-        }
-        catch { }
+        pacing = true;
+        const step = () => {
+            if (ws.readyState !== WebSocket.OPEN)
+                return;
+            if (canceled)
+                return;
+            const due = t0 + (++tick) * pacerMs;
+            const now = performance.now();
+            const frame = queue.length ? queue.shift() : Buffer.alloc(160, 0xff); // μ-law silence
+            ws.send(JSON.stringify({
+                event: "media",
+                streamSid,
+                sequenceNumber: String(++seq),
+                media: { payload: frame.toString("base64") },
+            }));
+            sentFrames++;
+            const delay = Math.max(0, due - now);
+            pacerTimer = setTimeout(step, delay);
+        };
+        pacerTimer = setTimeout(step, pacerMs);
     };
-    ws.once("close", onWsCloseOrError);
-    ws.once("error", onWsCloseOrError);
-    // מילוי התור מתוך הפלט הגולמי של ffmpeg
-    ff.stdout.on("data", (chunk) => {
-        const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
-        let off = 0;
-        while (off + 160 <= data.length) {
-            if (queue.length < MAX_QUEUE) {
-                queue.push(data.subarray(off, off + 160));
-            }
-            off += 160;
-        }
-        carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
-    });
-    // סגירה מסודרת: לרוקן תור, לסמן סוף, ולנקות מאזינים
-    await new Promise((resolve) => {
-        ff.once("close", () => {
-            const drain = setInterval(() => {
-                if (queue.length === 0) {
-                    clearInterval(drain);
-                    clearInterval(pacer);
-                    try {
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } }));
-                        }
+    // Stream reader → frames
+    (async () => {
+        try {
+            const maybeReader = res.body;
+            const reader = typeof maybeReader?.getReader === "function" ? maybeReader.getReader() : null;
+            if (reader) {
+                while (true) {
+                    if (ctrl.signal.aborted)
+                        break;
+                    const { value, done } = await reader.read();
+                    if (done)
+                        break;
+                    if (!value?.length)
+                        continue;
+                    const chunk = Buffer.from(value);
+                    const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+                    let off = 0;
+                    while (off + 160 <= data.length) {
+                        queue.push(data.subarray(off, off + 160));
+                        off += 160;
                     }
-                    catch { }
-                    ws.off("close", onWsCloseOrError);
-                    ws.off("error", onWsCloseOrError);
-                    console.log(`[ffmpeg] closed. frames sent total: ${sentFrames}`);
-                    resolve();
+                    carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
+                    if (!pacing && queue.length >= startBufferFrames)
+                        startPacer();
                 }
-            }, 50);
-        });
-    });
+            }
+            else {
+                // Fallback for older runtimes: Node Readable
+                for await (const chunk of res.body) {
+                    const b = Buffer.from(chunk);
+                    const data = carry.length ? Buffer.concat([carry, b]) : b;
+                    let off = 0;
+                    while (off + 160 <= data.length) {
+                        queue.push(data.subarray(off, off + 160));
+                        off += 160;
+                    }
+                    carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
+                    if (!pacing && queue.length >= startBufferFrames)
+                        startPacer();
+                }
+            }
+        }
+        catch (e) {
+            if (e?.name === "AbortError") {
+                canceled = true;
+            }
+            else {
+                console.error("[TTS stream read error]", e?.message || e);
+            }
+        }
+    })();
+    // Wait for queue drain or cancel
+    try {
+        while (!ctrl.signal.aborted) {
+            if (!pacing && queue.length > 0)
+                startPacer();
+            if (pacing && queue.length === 0 && res.body) {
+                await nextTick(pacerMs * 2);
+                if (queue.length === 0)
+                    break;
+            }
+            await nextTick(10);
+        }
+    }
+    finally {
+        cleanupAbort();
+        if (pacerTimer)
+            clearTimeout(pacerTimer);
+        try {
+            if (ws.readyState === WebSocket.OPEN && !canceled) {
+                ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } }));
+            }
+        }
+        catch { }
+        console.log(`[TTS] frames sent: ${sentFrames} (canceled=${ctrl.signal.aborted})`);
+    }
+    return ctrl.signal.aborted ? "canceled" : "ok";
 }
-//# sourceMappingURL=elevenToTwilio.js.map
+export default speakTextToTwilio;
