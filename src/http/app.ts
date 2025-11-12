@@ -1,57 +1,79 @@
 // src/http/app.ts
-import express from "express";
+import express, { Request, Response } from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
 
-const XI_API = "https://api.elevenlabs.io/v1";
+const XI_API = process.env.XI_API_BASE ?? "https://api.elevenlabs.io/v1";
+
+type TtsQuery = {
+  text?: string;
+  voice_id?: string;
+  model?: string;
+  output_format?: string;
+  language_code?: string;
+  voice_settings?: string; // JSON string
+  optimize_streaming_latency?: string | number | boolean;
+};
+
+function parseVoiceSettings(input?: string) {
+  if (!input) return undefined;
+  try {
+    const v = JSON.parse(input);
+    return v;
+  } catch {
+    return undefined;
+  }
+}
 
 export function createHttpApp() {
   const app = express();
+  app.disable("x-powered-by");
   app.use(cors({ origin: "*", maxAge: 600 }));
 
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
-  app.get("/stream/tts", async (req, res) => {
-    try {
-      const text = String(req.query.text || "");
-      if (!text.trim()) {
-        return res.status(400).json({ error: "Missing 'text' query param" });
-      }
-
-      const voiceId =
-        (req.query.voice_id as string) ||
-        process.env.ELEVENLABS_VOICE_ID ||
-        "";
-      if (!voiceId) {
-        return res
-          .status(400)
-          .json({ error: "voice_id required (or set ELEVENLABS_VOICE_ID)" });
-      }
-
-      const model = String(
-        req.query.model || process.env.DEFAULT_MODEL || "eleven_v3"
-      );
-
-      const output_format = String(
-        req.query.output_format ||
-          process.env.DEFAULT_OUTPUT_FORMAT ||
-          "ulaw_8000" // ← default for phone
-      );
-
-      const language_code = String(req.query.language_code || "he");
-
-      // Optional per-request voice tuning
-      const voice_settings = req.query.voice_settings
-        ? JSON.parse(String(req.query.voice_settings))
-        : undefined;
-
+  app.get(
+    "/stream/tts",
+    async (
+      req: Request<unknown, unknown, unknown, TtsQuery>,
+      res: Response
+    ) => {
       const apiKey = process.env.ELEVENLABS_API_KEY;
       if (!apiKey) {
         return res.status(500).json({ error: "ELEVENLABS_API_KEY not set" });
       }
 
-      const qs = new URLSearchParams();
-      qs.set("output_format", output_format);
+      const text = String(req.query.text ?? "").trim();
+      if (!text) {
+        return res.status(400).json({ error: "Missing 'text' query param" });
+      }
+
+      const voiceId = String(
+        req.query.voice_id ?? process.env.ELEVENLABS_VOICE_ID ?? ""
+      );
+      if (!voiceId) {
+        return res.status(400).json({
+          error: "voice_id required (or set ELEVENLABS_VOICE_ID)",
+        });
+      }
+
+      const model = String(
+        req.query.model ?? process.env.DEFAULT_MODEL ?? "eleven_v3"
+      );
+
+      // Telephony-safe default
+      const output_format = String(
+        req.query.output_format ??
+          process.env.DEFAULT_OUTPUT_FORMAT ??
+          "ulaw_8000"
+      );
+
+      // ElevenLabs expects "he" for Hebrew
+      const language_code = String(req.query.language_code ?? "he");
+
+      const voice_settings = parseVoiceSettings(req.query.voice_settings);
+
+      const qs = new URLSearchParams({ output_format });
 
       // Don't set optimize_streaming_latency for v3
       const optLat =
@@ -64,54 +86,81 @@ export function createHttpApp() {
       const url = `${XI_API}/text-to-speech/${encodeURIComponent(
         voiceId
       )}/stream?${qs.toString()}`;
-
-      console.log("[TTS upstream] POST", url, "model:", model);
-
-      const body: Record<string, any> = {
+      const body: Record<string, unknown> = {
         text,
         model_id: model,
         language_code,
+        ...(voice_settings ? { voice_settings } : {}),
       };
-      if (voice_settings) body.voice_settings = voice_settings;
 
-      const upstream = await fetch(url, {
-        method: "POST",
-        headers: {
-          "xi-api-key": apiKey,
-          "content-type": "application/json",
-          accept: "*/*", // allow ulaw/pcm/mp3
-        },
-        body: JSON.stringify(body),
-      });
+      // Abort upstream if client disconnects
+      const controller = new AbortController();
+      const abortUpstream = () => controller.abort();
+      req.on("close", abortUpstream);
+      req.on("aborted", abortUpstream);
 
-      const ct = upstream.headers.get("content-type") || "";
-      console.log(
-        `[TTS upstream] status=${upstream.status} content-type=${ct}`
-      );
-
-      if (!upstream.ok || !upstream.body) {
-        const msg = await upstream.text().catch(() => upstream.statusText);
-        console.error(`[TTS upstream] ERROR ${upstream.status}: ${msg}`);
-        return res.status(502).json({
-          error: "elevenlabs upstream error",
-          upstream_status: upstream.status,
-          model_tried: model,
-          voice_id: voiceId,
-          msg,
+      try {
+        console.log("[TTS upstream] POST", url, "model:", model);
+        const upstream = await fetch(url, {
+          method: "POST",
+          headers: {
+            "xi-api-key": apiKey,
+            "content-type": "application/json",
+            accept: "*/*", // ulaw/pcm/mp3
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
         });
-      }
 
-      // Pass-through regardless of content-type
-      res.setHeader("Content-Type", ct || "application/octet-stream");
-      res.setHeader("Cache-Control", "no-store");
-      Readable.fromWeb(upstream.body as any).pipe(res);
-    } catch (err: any) {
-      console.error("TTS error:", err);
-      res
-        .status(500)
-        .json({ error: "internal", message: err?.message || String(err) });
+        const ct = upstream.headers.get("content-type") ?? "";
+        console.log(
+          "[TTS upstream] status=%s content-type=%s",
+          upstream.status,
+          ct
+        );
+
+        if (!upstream.ok || !upstream.body) {
+          const msg = await upstream.text().catch(() => upstream.statusText);
+          console.error("[TTS upstream] ERROR %s: %s", upstream.status, msg);
+          return res.status(502).json({
+            error: "elevenlabs upstream error",
+            upstream_status: upstream.status,
+            model_tried: model,
+            voice_id: voiceId,
+            msg,
+          });
+        }
+
+        // Stream pass-through
+        res.setHeader("Content-Type", ct || "application/octet-stream");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("X-Accel-Buffering", "no"); // disable buffering (nginx)
+        res.setHeader("Connection", "keep-alive");
+        res.flushHeaders?.();
+
+        const nodeReadable = Readable.fromWeb(upstream.body as any);
+        nodeReadable.on("error", (e) => {
+          console.error("[TTS pipe] error:", e);
+          try {
+            res.destroy(e as Error);
+          } catch {}
+        });
+        nodeReadable.pipe(res);
+      } catch (err: any) {
+        if (err?.name === "AbortError") {
+          console.warn("[TTS upstream] aborted by client");
+          return;
+        }
+        console.error("TTS error:", err);
+        res
+          .status(500)
+          .json({ error: "internal", message: err?.message ?? String(err) });
+      } finally {
+        (req as any).off?.("close", abortUpstream);
+        (req as any).off?.("aborted", abortUpstream);
+      }
     }
-  });
+  );
 
   return app;
 }

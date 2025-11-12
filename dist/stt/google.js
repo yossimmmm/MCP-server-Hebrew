@@ -1,4 +1,3 @@
-// src/stt/google.ts
 import fs from "fs";
 import { createPrivateKey } from "node:crypto";
 import { SpeechClient } from "@google-cloud/speech";
@@ -44,20 +43,61 @@ export class GoogleSttSession {
     closed = false;
     cb;
     acceptFinal;
+    // EOU logic
+    eouMs = Number(process.env.STT_EOU_MS || "750");
+    lastPartial = "";
+    lastPartialAt = 0;
+    eouTimer = null;
+    scheduleEOU = () => {
+        if (!this.eouMs)
+            return;
+        if (this.eouTimer)
+            clearTimeout(this.eouTimer);
+        if (!this.lastPartial)
+            return;
+        this.eouTimer = setTimeout(() => {
+            const t = this.lastPartial;
+            this.lastPartial = "";
+            if (t && this.acceptFinal(t)) {
+                this.cb.onFinal?.(t);
+                console.log("[STT final eou]", t);
+            }
+        }, this.eouMs);
+    };
+    clearEOU = () => {
+        if (this.eouTimer)
+            clearTimeout(this.eouTimer);
+        this.eouTimer = null;
+        this.lastPartial = "";
+        this.lastPartialAt = 0;
+    };
     constructor(cb = {}) {
         this.cb = cb;
         this.client = makeSpeechClient();
         const dedupMs = Number(process.env.STT_DEDUP_WINDOW_MS || "1800");
         this.acceptFinal = createFinalDeduper(dedupMs);
         const languageCode = process.env.STT_LANGUAGE_CODE || "he-IL";
+        // Optional model tuning/envs (safe defaults)
+        const enablePunc = String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
+        const useEnhanced = String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
+        const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
+        const speechContexts = process.env.STT_HINTS
+            ? [{ phrases: process.env.STT_HINTS.split("|").map(s => s.trim()).filter(Boolean) }]
+            : undefined;
         const request = {
             config: {
                 encoding: "LINEAR16",
                 sampleRateHertz: 8000,
                 languageCode,
-                enableAutomaticPunctuation: true,
+                enableAutomaticPunctuation: enablePunc,
+                useEnhanced,
+                model, // only used if provided
+                speechContexts, // lightweight biasing
+                audioChannelCount: 1,
             },
             interimResults: true,
+            // NOTE: We keep singleUtterance false for continuous mode; EOU handled by timer
+            // singleUtterance: false,
         };
         try {
             const recognizeStream = this.client
@@ -72,9 +112,23 @@ export class GoogleSttSession {
                         "(IAM & Admin → Service Accounts → <your SA> → Keys → Add key → Create new key → JSON),\n" +
                         "or set GOOGLE_CREDENTIALS_B64/GOOGLE_CREDENTIALS_JSON. Do not reformat the PEM.");
                 }
+                // Flush last partial as best-effort final if the stream errors
+                if (this.lastPartial) {
+                    const t = this.lastPartial;
+                    this.clearEOU();
+                    if (this.acceptFinal(t))
+                        this.cb.onFinal?.(t);
+                }
             })
                 .on("end", () => {
                 this.closed = true;
+                // Flush last partial if stream closes
+                if (this.lastPartial) {
+                    const t = this.lastPartial;
+                    this.clearEOU();
+                    if (this.acceptFinal(t))
+                        this.cb.onFinal?.(t);
+                }
             })
                 .on("data", (data) => {
                 try {
@@ -86,6 +140,7 @@ export class GoogleSttSession {
                             continue;
                         if (r.isFinal) {
                             const t = alt.transcript;
+                            this.clearEOU();
                             if (this.acceptFinal(t)) {
                                 this.cb.onFinal?.(t);
                                 console.log("[STT final]", t);
@@ -95,7 +150,11 @@ export class GoogleSttSession {
                             }
                         }
                         else {
-                            this.cb.onPartial?.(alt.transcript);
+                            // INTERIM
+                            this.lastPartial = alt.transcript;
+                            this.lastPartialAt = Date.now();
+                            this.cb.onPartial?.(this.lastPartial);
+                            this.scheduleEOU();
                         }
                     }
                 }
@@ -139,6 +198,7 @@ export class GoogleSttSession {
             console.error("[STT end error]", e?.message || e);
         }
         this.audioIn = null;
+        this.clearEOU();
     }
 }
 export function createGoogleSession(cb) {

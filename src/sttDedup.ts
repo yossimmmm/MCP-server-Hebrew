@@ -1,28 +1,21 @@
-// sttDedup.ts
-const BIDI = /[\u200E\u200F\u061C]/g; // LRM, RLM, ALM
-const PUNCT = /[.,!?，、؛…"'“”‘’]/g;
-
-export function normalizeHebrew(s: string) {
-  return (s || "")
-    .normalize("NFKC")
-    .replace(BIDI, "")
-    .replace(PUNCT, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export function createFinalDeduper(msWindow = 2000) {
-  let lastNorm = "";
+// src/sttDedup.ts
+export function createFinalDeduper(windowMs = 3000) {
+  let last = "";
   let lastAt = 0;
-  return (text: string) => {
+
+  const norm = (s: string) =>
+    s.toLowerCase().replace(/[.,!?;:"'׳״()\-–—]/g, "").replace(/\s+/g, " ").trim();
+
+  return (t: string) => {
+    const n = norm(t);
     const now = Date.now();
-    const norm = normalizeHebrew(text);
-    const isDup = norm && norm === lastNorm && now - lastAt < msWindow;
-    if (!isDup && norm) {
-      lastNorm = norm;
-      lastAt = now;
-      return true; // accept
-    }
-    return false; // drop duplicate
+
+    // same or prefix/suffix-like duplicates within window
+    const isDup = n === last || n.startsWith(last) || last.startsWith(n);
+
+    const accept = !isDup || now - lastAt > windowMs;
+    if (accept) { last = n; lastAt = now; }
+    else console.log("[STT final dup] dropped");
+    return accept;
   };
 }

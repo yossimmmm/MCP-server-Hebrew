@@ -1,4 +1,3 @@
-// src/stt/google.ts
 import fs from "fs";
 import { createPrivateKey } from "node:crypto";
 import { Writable } from "node:stream";
@@ -60,6 +59,34 @@ export class GoogleSttSession {
   private cb: Callbacks;
   private acceptFinal: (t: string) => boolean;
 
+  // EOU logic
+  private eouMs = Number(process.env.STT_EOU_MS || "750");
+  private lastPartial = "";
+  private lastPartialAt = 0;
+  private eouTimer: NodeJS.Timeout | null = null;
+
+  private scheduleEOU = () => {
+    if (!this.eouMs) return;
+    if (this.eouTimer) clearTimeout(this.eouTimer);
+    if (!this.lastPartial) return;
+
+    this.eouTimer = setTimeout(() => {
+      const t = this.lastPartial;
+      this.lastPartial = "";
+      if (t && this.acceptFinal(t)) {
+        this.cb.onFinal?.(t);
+        console.log("[STT final eou]", t);
+      }
+    }, this.eouMs);
+  };
+
+  private clearEOU = () => {
+    if (this.eouTimer) clearTimeout(this.eouTimer);
+    this.eouTimer = null;
+    this.lastPartial = "";
+    this.lastPartialAt = 0;
+  };
+
   constructor(cb: Callbacks = {}) {
     this.cb = cb;
     this.client = makeSpeechClient();
@@ -67,14 +94,29 @@ export class GoogleSttSession {
     this.acceptFinal = createFinalDeduper(dedupMs);
 
     const languageCode = process.env.STT_LANGUAGE_CODE || "he-IL";
+
+    // Optional model tuning/envs (safe defaults)
+    const enablePunc = String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
+    const useEnhanced = String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
+    const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
+    const speechContexts = process.env.STT_HINTS
+      ? [{ phrases: process.env.STT_HINTS.split("|").map(s => s.trim()).filter(Boolean) }]
+      : undefined;
+
     const request = {
       config: {
         encoding: "LINEAR16" as const,
         sampleRateHertz: 8000,
         languageCode,
-        enableAutomaticPunctuation: true,
+        enableAutomaticPunctuation: enablePunc,
+        useEnhanced,
+        model,              // only used if provided
+        speechContexts,     // lightweight biasing
+        audioChannelCount: 1,
       },
       interimResults: true,
+      // NOTE: We keep singleUtterance false for continuous mode; EOU handled by timer
+      // singleUtterance: false,
     };
 
     try {
@@ -93,9 +135,22 @@ export class GoogleSttSession {
                 "or set GOOGLE_CREDENTIALS_B64/GOOGLE_CREDENTIALS_JSON. Do not reformat the PEM."
             );
           }
+
+          // Flush last partial as best-effort final if the stream errors
+          if (this.lastPartial) {
+            const t = this.lastPartial;
+            this.clearEOU();
+            if (this.acceptFinal(t)) this.cb.onFinal?.(t);
+          }
         })
         .on("end", () => {
           this.closed = true;
+          // Flush last partial if stream closes
+          if (this.lastPartial) {
+            const t = this.lastPartial;
+            this.clearEOU();
+            if (this.acceptFinal(t)) this.cb.onFinal?.(t);
+          }
         })
         .on("data", (data: any) => {
           try {
@@ -107,6 +162,7 @@ export class GoogleSttSession {
 
               if (r.isFinal) {
                 const t = alt.transcript;
+                this.clearEOU();
                 if (this.acceptFinal(t)) {
                   this.cb.onFinal?.(t);
                   console.log("[STT final]", t);
@@ -114,7 +170,11 @@ export class GoogleSttSession {
                   console.log("[STT final dup] dropped");
                 }
               } else {
-                this.cb.onPartial?.(alt.transcript);
+                // INTERIM
+                this.lastPartial = alt.transcript;
+                this.lastPartialAt = Date.now();
+                this.cb.onPartial?.(this.lastPartial);
+                this.scheduleEOU();
               }
             }
           } catch (err: any) {
@@ -155,6 +215,7 @@ export class GoogleSttSession {
       console.error("[STT end error]", e?.message || e);
     }
     this.audioIn = null;
+    this.clearEOU();
   }
 }
 

@@ -1,32 +1,47 @@
 // src/tts/elevenToTwilio.ts
 import WebSocket from "ws";
 import { performance } from "node:perf_hooks";
+import { Buffer } from "node:buffer";
 
-const XI_API = "https://api.elevenlabs.io/v1";
+const XI_API = process.env.XI_API_BASE ?? "https://api.elevenlabs.io/v1";
+const FRAME_BYTES = 160; // 20ms of μ-law @ 8kHz
 
-type SpeakOpts = {
+// Use a single alias so generic params match everywhere
+type U8 = Uint8Array<ArrayBufferLike>;
+
+// μ-law silence frame (0xFF)
+const ULawSilenceU8: U8 = new Uint8Array(FRAME_BYTES) as U8;
+ULawSilenceU8.fill(0xff);
+
+export type SpeakOpts = {
   voiceId?: string;
-  modelId?: string;                 // defaults to eleven_v3
-  startBufferFrames?: number;       // jitter buffer before start (default 12 ≈ 240ms)
-  pacerMs?: number;                 // 20ms
-  signal?: AbortSignal;             // for barge-in cancel
+  modelId?: string;
+  startBufferFrames?: number;
+  pacerMs?: number;
+  signal?: AbortSignal;
   voiceSettings?: {
     stability?: number;
     similarity_boost?: number;
     style?: number;
     use_speaker_boost?: boolean;
-    speaking_rate?: number;         // if available on your account
+    speaking_rate?: number;
   };
-  language_code?: string;           // e.g. "he"
+  language_code?: string;
+  sequenceRef?: { value: number };
 };
 
-function nextTick(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const toB64 = (u8: U8) => Buffer.from(u8).toString("base64");
+
+function concatU8(a: U8, b: U8): U8 {
+  const out = new Uint8Array(a.length + b.length) as U8;
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out as U8;
 }
 
 /**
- * Streams Hebrew TTS as μ-law 8kHz directly from ElevenLabs and feeds Twilio as 20ms frames (160 bytes).
- * Supports barge-in via AbortSignal.
+ * Streams μ-law 8kHz audio from ElevenLabs and feeds Twilio as 20ms frames.
  */
 export async function speakTextToTwilio(
   ws: WebSocket,
@@ -35,36 +50,38 @@ export async function speakTextToTwilio(
   opts: SpeakOpts = {}
 ): Promise<"ok" | "canceled"> {
   if (!streamSid) throw new Error("Missing streamSid");
+
   const {
     voiceId = process.env.ELEVENLABS_VOICE_ID || "",
     modelId = process.env.DEFAULT_MODEL || "eleven_v3",
-    startBufferFrames = 12,
+    startBufferFrames = Number(process.env.TTS_START_FRAMES || 10),
     pacerMs = 20,
     signal,
     voiceSettings,
     language_code = "he",
+    sequenceRef,
   } = opts;
 
   if (!voiceId) throw new Error("voiceId required (set ELEVENLABS_VOICE_ID)");
-
   const apiKey = process.env.ELEVENLABS_API_KEY;
   if (!apiKey) throw new Error("ELEVENLABS_API_KEY not set");
 
-  // Build ElevenLabs streaming URL for μ-law at 8kHz (telephony-native)
   const qs = new URLSearchParams();
-  qs.set("output_format", "ulaw_8000"); // native Twilio format
+  qs.set("output_format", "ulaw_8000");
+  const url = `${XI_API}/text-to-speech/${encodeURIComponent(
+    voiceId
+  )}/stream?${qs.toString()}`;
 
-  const url = `${XI_API}/text-to-speech/${encodeURIComponent(voiceId)}/stream?${qs.toString()}`;
-
-  // Prepare request body
-  const body: Record<string, any> = {
+  const body: Record<string, unknown> = {
     text,
     model_id: modelId,
     language_code,
+    ...(voiceSettings ? { voice_settings: voiceSettings } : {}),
   };
-  if (voiceSettings) body.voice_settings = voiceSettings;
 
-  console.log(`[TTS] POST XI stream ulaw_8000 model=${modelId} voice=${voiceId} text=***`);
+  console.log(
+    `[TTS] POST XI stream ulaw_8000 model=${modelId} voice=${voiceId} text=***`
+  );
 
   const ctrl = new AbortController();
   const onAbort = () => ctrl.abort();
@@ -78,7 +95,8 @@ export async function speakTextToTwilio(
     if (signal) signal.removeEventListener("abort", onAbort);
   };
 
-  let res: Response | null = null;
+  const tFetchStart = performance.now();
+  let res: any;
   try {
     res = await fetch(url, {
       method: "POST",
@@ -96,25 +114,29 @@ export async function speakTextToTwilio(
     throw e;
   }
 
-  const ct = res.headers.get("content-type") || "";
+  const ct = res.headers?.get?.("content-type") ?? "";
   console.log(`[TTS upstream] status=${res.status} ct=${ct}`);
   if (!res.ok || !res.body) {
     cleanupAbort();
-    const msg = await res.text().catch(() => res.statusText);
+    const msg =
+      (await res.text?.().catch?.(() => res.statusText)) ??
+      String(res.statusText ?? "upstream error");
     throw new Error(`ElevenLabs upstream error ${res.status}: ${msg}`);
   }
 
-  // Jitter buffer: gather 160-byte μ-law frames
-  const queue: Buffer[] = [];
-  let carry = Buffer.alloc(0); // IMPORTANT: no generic annotation
-  let seq = 0;
+  // Use Uint8Array (generic unified) for carry/queue
+  const queue: U8[] = [];
+  let carry: U8 = new Uint8Array(0) as U8;
+  let localSeq = 0;
+  const nextSeq = () => (sequenceRef ? ++sequenceRef.value : ++localSeq);
   let sentFrames = 0;
 
-  // Start pacer when we have a little buffer
+  // Pacer state
   let pacing = false;
   let pacerTimer: NodeJS.Timeout | undefined;
   let t0 = performance.now();
   let tick = 0;
+  let firstFrameMs = -1;
 
   const startPacer = () => {
     if (pacing) return;
@@ -124,16 +146,18 @@ export async function speakTextToTwilio(
       if (ws.readyState !== WebSocket.OPEN) return;
       if (canceled) return;
 
-      const due = t0 + (++tick) * pacerMs;
+      const due = t0 + ++tick * pacerMs;
       const now = performance.now();
 
-      const frame = queue.length ? queue.shift()! : Buffer.alloc(160, 0xff); // μ-law silence
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        sequenceNumber: String(++seq),
-        media: { payload: frame.toString("base64") },
-      }));
+      const frame: U8 = queue.length ? queue.shift()! : ULawSilenceU8;
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          sequenceNumber: String(nextSeq()),
+          media: { payload: toB64(frame) },
+        })
+      );
       sentFrames++;
 
       const delay = Math.max(0, due - now);
@@ -143,11 +167,31 @@ export async function speakTextToTwilio(
     pacerTimer = setTimeout(step, pacerMs);
   };
 
-  // Stream reader → frames
+  // Reader → push 160-byte frames into queue
   (async () => {
     try {
-      const maybeReader = (res!.body as any);
-      const reader = typeof maybeReader?.getReader === "function" ? maybeReader.getReader() : null;
+      const maybeReader: any = res!.body as any;
+      const reader: any =
+        typeof maybeReader?.getReader === "function"
+          ? maybeReader.getReader()
+          : null;
+
+      const onChunk = (chunk: U8) => {
+        const data: U8 = carry.length ? (concatU8(carry, chunk) as U8) : chunk;
+
+        let off = 0;
+        while (off + FRAME_BYTES <= data.length) {
+          if (firstFrameMs < 0) firstFrameMs = performance.now() - tFetchStart;
+          queue.push(data.subarray(off, off + FRAME_BYTES) as U8);
+          off += FRAME_BYTES;
+        }
+        carry = off < data.length ? (data.subarray(off) as U8) : (new Uint8Array(0) as U8);
+
+        if (!pacing && queue.length >= startBufferFrames) {
+          t0 = performance.now();
+          startPacer();
+        }
+      };
 
       if (reader) {
         while (true) {
@@ -155,30 +199,12 @@ export async function speakTextToTwilio(
           const { value, done } = await reader.read();
           if (done) break;
           if (!value?.length) continue;
-
-          const chunk = Buffer.from(value as Uint8Array);
-          const data = carry.length ? Buffer.concat([carry, chunk]) : chunk;
-          let off = 0;
-          while (off + 160 <= data.length) {
-            queue.push(data.subarray(off, off + 160));
-            off += 160;
-          }
-          carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
-
-          if (!pacing && queue.length >= startBufferFrames) startPacer();
+          onChunk(value as U8);
         }
       } else {
-        // Fallback for older runtimes: Node Readable
-        for await (const chunk of res!.body as any as AsyncIterable<Uint8Array>) {
-          const b = Buffer.from(chunk);
-          const data = carry.length ? Buffer.concat([carry, b]) : b;
-          let off = 0;
-          while (off + 160 <= data.length) {
-            queue.push(data.subarray(off, off + 160));
-            off += 160;
-          }
-          carry = off < data.length ? data.subarray(off) : Buffer.alloc(0);
-          if (!pacing && queue.length >= startBufferFrames) startPacer();
+        const { Readable } = await import("node:stream");
+        for await (const chunk of Readable.fromWeb(res!.body as any) as AsyncIterable<U8>) {
+          onChunk(chunk as U8);
         }
       }
     } catch (e: any) {
@@ -190,26 +216,37 @@ export async function speakTextToTwilio(
     }
   })();
 
-  // Wait for queue drain or cancel
+  // Drain loop
   try {
     while (!ctrl.signal.aborted) {
-      if (!pacing && queue.length > 0) startPacer();
-
+      if (!pacing && queue.length > 0) {
+        t0 = performance.now();
+        startPacer();
+      }
       if (pacing && queue.length === 0 && res.body) {
-        await nextTick(pacerMs * 2);
+        await sleep(pacerMs * 2);
         if (queue.length === 0) break;
       }
-      await nextTick(10);
+      await sleep(10);
     }
   } finally {
     cleanupAbort();
     if (pacerTimer) clearTimeout(pacerTimer);
     try {
       if (ws.readyState === WebSocket.OPEN && !canceled) {
-        ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts_end" } }));
+        ws.send(
+          JSON.stringify({
+            event: "mark",
+            streamSid,
+            mark: { name: "tts_end" },
+          })
+        );
       }
     } catch {}
-    console.log(`[TTS] frames sent: ${sentFrames} (canceled=${ctrl.signal.aborted})`);
+    const ttff = firstFrameMs >= 0 ? Math.round(firstFrameMs) : -1;
+    console.log(
+      `[TTS] frames sent: ${sentFrames} (canceled=${ctrl.signal.aborted}) ttff_ms=${ttff}`
+    );
   }
 
   return ctrl.signal.aborted ? "canceled" : "ok";

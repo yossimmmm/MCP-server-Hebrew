@@ -12,29 +12,23 @@ const PUBLIC =
   (process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") ??
     `http://localhost:${PORT}`);
 
-// Build the WS endpoint URL from PUBLIC (http→ws, https→wss)
 function toWsUrl(baseHttpUrl: string, path: string) {
   const u = new URL(path, baseHttpUrl);
-  u.protocol = u.protocol.replace("http", "ws"); // http->ws, https->wss
+  u.protocol = u.protocol.replace("http", "ws");
   return u.toString();
 }
 const PUBLIC_WS = toWsUrl(PUBLIC, "/ws/twilio");
 
-// Construct HTTP app and routes
 const app = createHttpApp();
 
-// Twilio webhooks
 app.post("/voice", twimlHandler());
 app.post("/twilio/stream-status", (_req, res) => res.sendStatus(204));
 
-// MCP endpoint(s)
 attachMcp(app, PUBLIC);
 
-// HTTP server + Twilio WS
 const server = http.createServer(app);
-attachTwilioWs(server);
+attachTwilioWs(server); // unchanged usage
 
-// Basic diagnostics
 server.on("error", (err) => {
   console.error("[server] error:", err);
   process.exitCode = 1;
@@ -46,7 +40,6 @@ server.listen(PORT, () => {
   console.log(`[twilio] WebSocket ${PUBLIC_WS}`);
 });
 
-// Graceful shutdown
 function shutdown(reason: string) {
   console.log(`[server] shutting down (${reason})...`);
   server.close((err) => {
