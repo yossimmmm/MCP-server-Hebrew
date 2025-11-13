@@ -1,3 +1,4 @@
+// src/stt/google.ts
 import fs from "fs";
 import { createPrivateKey } from "node:crypto";
 import { SpeechClient } from "@google-cloud/speech";
@@ -89,7 +90,7 @@ export class GoogleSttSession {
         // Optional model tuning/envs (safe defaults)
         const enablePunc = String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
         const useEnhanced = String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
-        const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
+        const model = undefined;
         const speechContexts = process.env.STT_HINTS
             ? [
                 {
@@ -105,14 +106,10 @@ export class GoogleSttSession {
                 sampleRateHertz: 8000,
                 languageCode,
                 enableAutomaticPunctuation: enablePunc,
-                useEnhanced,
-                model, // only used if provided
-                speechContexts, // lightweight biasing
+                speechContexts,
                 audioChannelCount: 1,
             },
             interimResults: true,
-            // NOTE: We keep singleUtterance false for continuous mode; EOU handled by timer
-            // singleUtterance: false,
         };
         try {
             const recognizeStream = this.client

@@ -1,3 +1,4 @@
+// src/tts/framePacer.ts
 import WebSocket from "ws";
 export class FramePacer {
     ws;

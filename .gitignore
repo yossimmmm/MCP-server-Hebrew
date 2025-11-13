@@ -10,3 +10,5 @@ sa.json
 
 # Google creds
 sa.json
+.sa.json.swp
+*.swp

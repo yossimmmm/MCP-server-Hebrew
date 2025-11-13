@@ -1,4 +1,6 @@
+// src/stt/googleChirpV2.ts
 import { v2 as speech } from "@google-cloud/speech";
+import { createFinalDeduper } from "../sttDedup.js";
 
 type V2Callbacks = {
   onData: (text: string, isFinal: boolean) => void;
@@ -7,17 +9,15 @@ type V2Callbacks = {
 };
 
 type V2Opts = {
-  apiEndpoint?: string; // e.g. "us-central1-speech.googleapis.com"
-  languageCode?: string; // default "he-IL"
-  model?: string; // default "chirp"
-  interimResults?: boolean; // default true
+  apiEndpoint?: string;
+  languageCode?: string;
+  interimResults?: boolean;
 } & V2Callbacks;
 
 export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
   const {
-    apiEndpoint,
-    languageCode = "he-IL",
-    model = "chirp",
+    apiEndpoint = process.env.SPEECH_V2_ENDPOINT,
+    languageCode = process.env.STT_LANGUAGE_CODE || "iw-IL",
     interimResults = true,
     onData,
     onError,
@@ -28,34 +28,71 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
     apiEndpoint ? { apiEndpoint } : undefined
   );
 
-  // v2 requires: first write is streamingConfig; subsequent writes send { audio: Buffer }
-  // Use explicitDecodingConfig for Twilio μ-law (8000 Hz, mono).
+  const eouMs = Number(process.env.STT_EOU_MS || "750");
+  const eouGuardMs = Number(process.env.STT_EOU_GUARD_MS || "500");
+  const minPartialChars = Number(process.env.STT_MIN_PARTIAL_CHARS || "3");
+  const dedupWindowMs = Number(process.env.STT_DEDUP_WINDOW_MS || "1800");
+  const acceptFinal = createFinalDeduper(dedupWindowMs);
+
+  let lastPartial = "";
+  let lastPartialAt = 0;
+  let lastGoogleFinalAt = 0;
+  let eouTimer: NodeJS.Timeout | null = null;
+
+  const scheduleEOU = () => {
+    if (!eouMs) return;
+    if (eouTimer) clearTimeout(eouTimer);
+    if (
+      !lastPartial ||
+      lastPartial.replace(/\s/g, "").length < minPartialChars
+    ) {
+      return;
+    }
+
+    eouTimer = setTimeout(() => {
+      const t = lastPartial;
+      lastPartial = "";
+
+      if (Date.now() - lastGoogleFinalAt < eouGuardMs) {
+        console.log("[STT v2 final eou] suppressed (recent Google final)");
+        return;
+      }
+
+      if (t && acceptFinal(t)) {
+        console.log("[STT v2 final eou]", t);
+        onData(t, true);
+      }
+    }, eouMs);
+  };
+
+  const clearEOU = () => {
+    if (eouTimer) clearTimeout(eouTimer);
+    eouTimer = null;
+    lastPartial = "";
+    lastPartialAt = 0;
+  };
+
   const streamingConfig = {
     config: {
       languageCodes: [languageCode],
-      model,
-      // Choose explicit decoding for raw headerless audio:
+      model: "chirp_3",
       explicitDecodingConfig: {
         encoding: "MULAW",
         sampleRateHertz: 8000,
         audioChannelCount: 1,
       },
-      // Enable punctuation (safe default). You can expose via env if you want.
       features: {
         enableAutomaticPunctuation: true,
       },
     },
     streamingFeatures: {
       interimResults,
-      // singleUtterance: false (default) → continuous stream; we handle EOU in higher layer
     },
   };
 
   let destroyed = false;
 
   const recognizeStream = client
-    // Using the private streaming method works reliably with v2 per community reports.
-    // See discussion: https://stackoverflow.com/q/76722471
     ._streamingRecognize()
     .on("data", (resp: any) => {
       try {
@@ -63,7 +100,32 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
         for (const r of resp.results) {
           const alt = r.alternatives?.[0];
           if (!alt?.transcript) continue;
-          onData(alt.transcript, !!r.isFinal);
+
+          if (r.isFinal) {
+            const t = alt.transcript;
+            clearEOU();
+            lastGoogleFinalAt = Date.now();
+            if (acceptFinal(t)) {
+              console.log("[STT v2 final]", t);
+              onData(t, true);
+            } else {
+              console.log("[STT v2 final dup] dropped");
+            }
+          } else {
+            lastPartial = alt.transcript;
+            lastPartialAt = Date.now();
+            const len = lastPartial.replace(/\s/g, "").length;
+            console.log(
+              "[STT v2 partial]",
+              lastPartial,
+              "| nonSpaceLen=",
+              len,
+              "| minPartialChars=",
+              minPartialChars
+            );
+            onData(lastPartial, false);
+            scheduleEOU();
+          }
         }
       } catch (e: any) {
         onError?.(e instanceof Error ? e : new Error(String(e)));
@@ -71,14 +133,30 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
     })
     .on("error", (err: any) => {
       destroyed = true;
+      console.error("[STT v2 error]", err?.message || err);
+      if (lastPartial) {
+        const t = lastPartial;
+        clearEOU();
+        if (acceptFinal(t)) {
+          console.log("[STT v2 final on error]", t);
+          onData(t, true);
+        }
+      }
       onError?.(err instanceof Error ? err : new Error(String(err)));
     })
     .on("end", () => {
       destroyed = true;
+      if (lastPartial) {
+        const t = lastPartial;
+        clearEOU();
+        if (acceptFinal(t)) {
+          console.log("[STT v2 final on end]", t);
+          onData(t, true);
+        }
+      }
       onEnd?.();
     });
 
-  // Send the initial config write
   recognizeStream.write({
     recognizer,
     streamingConfig,
@@ -88,7 +166,6 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
     if (destroyed) return;
     try {
       const ulaw = Buffer.from(b64, "base64");
-      // Send raw μ-law bytes; v2 will decode per explicitDecodingConfig
       recognizeStream.write({ audio: ulaw });
     } catch (e: any) {
       destroyed = true;

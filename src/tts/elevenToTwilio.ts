@@ -1,4 +1,3 @@
-// src/tts/elevenToTwilio.ts
 import WebSocket from "ws";
 import { performance } from "node:perf_hooks";
 import { Buffer } from "node:buffer";
@@ -138,6 +137,9 @@ export async function speakTextToTwilio(
   let tick = 0;
   let firstFrameMs = -1;
 
+  // חדש: דגל שמסמן ש־ElevenLabs סיים להזרים
+  let upstreamDone = false;
+
   const startPacer = () => {
     if (pacing) return;
     pacing = true;
@@ -167,6 +169,16 @@ export async function speakTextToTwilio(
     pacerTimer = setTimeout(step, pacerMs);
   };
 
+  const flushCarryAsFrame = () => {
+    if (carry.length > 0) {
+      const padded = new Uint8Array(FRAME_BYTES) as U8;
+      padded.fill(0xff);
+      padded.set(carry.subarray(0, Math.min(carry.length, FRAME_BYTES)), 0);
+      queue.push(padded);
+      carry = new Uint8Array(0) as U8;
+    }
+  };
+
   // Reader → push 160-byte frames into queue
   (async () => {
     try {
@@ -185,7 +197,10 @@ export async function speakTextToTwilio(
           queue.push(data.subarray(off, off + FRAME_BYTES) as U8);
           off += FRAME_BYTES;
         }
-        carry = off < data.length ? (data.subarray(off) as U8) : (new Uint8Array(0) as U8);
+        carry =
+          off < data.length
+            ? (data.subarray(off) as U8)
+            : (new Uint8Array(0) as U8);
 
         if (!pacing && queue.length >= startBufferFrames) {
           t0 = performance.now();
@@ -197,15 +212,22 @@ export async function speakTextToTwilio(
         while (true) {
           if (ctrl.signal.aborted) break;
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) {
+            upstreamDone = true;
+            flushCarryAsFrame();
+            break;
+          }
           if (!value?.length) continue;
           onChunk(value as U8);
         }
       } else {
         const { Readable } = await import("node:stream");
         for await (const chunk of Readable.fromWeb(res!.body as any) as AsyncIterable<U8>) {
+          if (ctrl.signal.aborted) break;
           onChunk(chunk as U8);
         }
+        upstreamDone = true;
+        flushCarryAsFrame();
       }
     } catch (e: any) {
       if (e?.name === "AbortError") {
@@ -213,6 +235,8 @@ export async function speakTextToTwilio(
       } else {
         console.error("[TTS stream read error]", e?.message || e);
       }
+      upstreamDone = true;
+      flushCarryAsFrame();
     }
   })();
 
@@ -223,10 +247,10 @@ export async function speakTextToTwilio(
         t0 = performance.now();
         startPacer();
       }
-      if (pacing && queue.length === 0 && res.body) {
-        await sleep(pacerMs * 2);
-        if (queue.length === 0) break;
-      }
+
+      // יוצאים רק כשאין יותר אודיו מהשרת וגם התור ריק
+      if (upstreamDone && queue.length === 0) break;
+
       await sleep(10);
     }
   } finally {

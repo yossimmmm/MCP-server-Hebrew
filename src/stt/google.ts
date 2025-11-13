@@ -1,3 +1,4 @@
+// src/stt/google.ts
 import fs from "fs";
 import { createPrivateKey } from "node:crypto";
 import { Writable } from "node:stream";
@@ -111,7 +112,7 @@ export class GoogleSttSession {
       String(process.env.STT_PUNCTUATION ?? "true").toLowerCase() !== "false";
     const useEnhanced =
       String(process.env.STT_USE_ENHANCED ?? "false").toLowerCase() === "true";
-    const model = process.env.STT_MODEL || undefined; // e.g. "phone_call" if supported in he-IL
+const model = undefined;
     const speechContexts = process.env.STT_HINTS
       ? [
           {
@@ -123,20 +124,16 @@ export class GoogleSttSession {
       : undefined;
 
     const request = {
-      config: {
-        encoding: "LINEAR16" as const,
-        sampleRateHertz: 8000,
-        languageCode,
-        enableAutomaticPunctuation: enablePunc,
-        useEnhanced,
-        model, // only used if provided
-        speechContexts, // lightweight biasing
-        audioChannelCount: 1,
-      },
-      interimResults: true,
-      // NOTE: We keep singleUtterance false for continuous mode; EOU handled by timer
-      // singleUtterance: false,
-    };
+  config: {
+    encoding: "LINEAR16" as const,
+    sampleRateHertz: 8000,
+    languageCode,
+    enableAutomaticPunctuation: enablePunc,
+    speechContexts,
+    audioChannelCount: 1,
+  },
+  interimResults: true,
+};
 
     try {
       const recognizeStream = this.client
