@@ -12,3 +12,4 @@ sa.json
 sa.json
 .sa.json.swp
 *.swp
+.env

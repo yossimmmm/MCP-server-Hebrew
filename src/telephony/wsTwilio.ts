@@ -6,6 +6,8 @@ import speakTextToTwilio from "../tts/elevenToTwilio.js";
 import { createGoogleSession } from "../stt/google.js";
 import { createHebrewChirp3Stream } from "../stt/googleChirpV2.js";
 import { LlmSession } from "../nlu/gemini.js";
+import { pickWaitingPhraseForHint } from "../nlu/waitingPhrases.js";
+import { playWaitingClip } from "../tts/staticWaitingClips.js";
 
 // נורמליזציה: גם אם ב-env כתוב 12, בפועל עובדים בין 3 ל-5
 const RAW_BARGE_IN_MIN_CHARS = Number(process.env.BARGE_IN_MIN_CHARS || "5");
@@ -15,7 +17,9 @@ const BARGE_IN_MIN_CHARS =
     : 3;
 
 const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10");
-const PACER_MS = Number(process.env.TTS_PACER_MS || process.env.TTS_PACER_MS || "20");
+const PACER_MS = Number(
+  process.env.TTS_PACER_MS || process.env.TTS_PACER_MS || "20"
+);
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "eleven_v3";
 const DEFAULT_LANG = process.env.TTS_LANGUAGE_CODE || "he";
 const CALL_GREETING = process.env.CALL_GREETING || "";
@@ -77,7 +81,6 @@ function envVoiceSettings() {
 
   const rate = num("XI_SPEAKING_RATE");
   if (rate != null && !Number.isNaN(rate)) {
-    // נשאיר את זה כמו שהוא אצלך – אם תרצה נעשה טיונינג מהיר בקובץ נפרד
     vs.speaking_rate = rate;
   }
 
@@ -138,6 +141,10 @@ export function attachTwilioWs(server: http.Server) {
     let latestPreviewReply = "";
     let llmInFlight: Promise<string> | null = null;
 
+    // hint למשפט ההמתנה הבא (שהLLM חוזה)
+    let nextWaitingHint: string | null = null;
+
+    // השמעת טקסט רגיל דרך ElevenLabs
     const speak = async (text: string) => {
       if (closed) return;
       if (!text || !text.trim()) return;
@@ -168,6 +175,45 @@ export function attachTwilioWs(server: http.Server) {
       } catch (e: any) {
         if (e?.name !== "AbortError") {
           console.error("[twilio][tts] error:", e?.message || e);
+        }
+      } finally {
+        ttsAbort = undefined;
+      }
+    };
+
+    // השמעת קליפ המתנה סטטי אחת (כן בטח / מעולה וכו')
+    const playWaiting = async (hint?: string | null) => {
+      if (closed) return;
+      if (!streamSid) return;
+
+      const phrase = pickWaitingPhraseForHint(hint ?? undefined);
+      if (!phrase) return;
+
+      try {
+        ttsAbort?.abort();
+      } catch {
+        // ignore
+      }
+
+      ttsAbort = new AbortController();
+
+      try {
+        console.log(
+          "[WAIT] playing waiting clip:",
+          phrase.id,
+          "| text=",
+          phrase.text
+        );
+        await playWaitingClip(
+          ws as WebSocket,
+          streamSid,
+          phrase.id,
+          seqRef,
+          ttsAbort.signal
+        );
+      } catch (e: any) {
+        if (e?.name !== "AbortError") {
+          console.error("[WAIT] error:", e?.message || e);
         }
       } finally {
         ttsAbort = undefined;
@@ -224,6 +270,7 @@ export function attachTwilioWs(server: http.Server) {
           const dt = Math.round(performance.now() - t0);
           console.log("[LLM preview done] ms=", dt, "reply=", reply);
           latestPreviewReply = reply;
+          // גם כאן ה-LLM יכול לעדכן waiting_hint, זה בסדר – האחרון תמיד מנצח
           return reply;
         } catch (e: any) {
           console.error("[LLM preview error]", e?.message || e);
@@ -234,7 +281,7 @@ export function attachTwilioWs(server: http.Server) {
       })();
     }
 
-    // FINAL → להשתמש ב-preview אם אפשר, אחרת פולבאק מלא
+    // FINAL → להשתמש ב-preview אם אפשר, אחרת פולבאק מלא + waiting clip
     async function handleFinalText(finalText: string) {
       const cleaned = (finalText || "").trim();
       if (!cleaned) return;
@@ -287,10 +334,25 @@ export function attachTwilioWs(server: http.Server) {
       let reply = await tryUsePreview();
 
       if (!reply) {
+        // אין preview מוכן → מריצים LLM + קליפ המתנה במקביל
+        const hintToUseNow = nextWaitingHint;
+        const waitPromise = streamSid
+          ? playWaiting(hintToUseNow)
+          : Promise.resolve();
+
         const t0 = performance.now();
         reply = await llm.reply(cleaned);
         const dt = Math.round(performance.now() - t0);
         console.log("[LLM final ms]", dt);
+
+        // לעדכן hint לסיבוב הבא
+        const updatedHint = llm.getWaitingHint();
+        if (updatedHint && updatedHint.trim()) {
+          nextWaitingHint = updatedHint.trim();
+          console.log("[LLM] updated waiting_hint:", nextWaitingHint);
+        }
+
+        await waitPromise.catch(() => {});
       }
 
       if (!streamSid) return;
