@@ -17,8 +17,9 @@ const BARGE_IN_MIN_CHARS =
     : 3;
 
 const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10");
+// תיקון: PACER_MS יקבל או TTS_PACER_MS או PACER_MS
 const PACER_MS = Number(
-  process.env.TTS_PACER_MS || process.env.TTS_PACER_MS || "20"
+  process.env.TTS_PACER_MS || process.env.PACER_MS || "20"
 );
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "eleven_v3";
 const DEFAULT_LANG = process.env.TTS_LANGUAGE_CODE || "he";
@@ -345,14 +346,14 @@ export function attachTwilioWs(server: http.Server) {
         const dt = Math.round(performance.now() - t0);
         console.log("[LLM final ms]", dt);
 
-        // לעדכן hint לסיבוב הבא
-        const updatedHint = llm.getWaitingHint();
-        if (updatedHint && updatedHint.trim()) {
-          nextWaitingHint = updatedHint.trim();
-          console.log("[LLM] updated waiting_hint:", nextWaitingHint);
-        }
-
         await waitPromise.catch(() => {});
+      }
+
+      // בשלב הזה יש לנו reply סופי (מ-preview או מפולבאק) → לעדכן waiting_hint לסיבוב הבא
+      const hintFromLlm = llm.getWaitingHint();
+      if (hintFromLlm && hintFromLlm.trim()) {
+        nextWaitingHint = hintFromLlm.trim();
+        console.log("[LLM] updated waiting_hint:", nextWaitingHint);
       }
 
       if (!streamSid) return;

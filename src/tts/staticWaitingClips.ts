@@ -10,6 +10,10 @@ type Clip = {
   frames: Buffer[];
 };
 
+const CLIPS_DIR =
+  process.env.WAITING_CLIPS_DIR ||
+  path.join(process.cwd(), "media", "waiting");
+
 const clips = new Map<string, Clip>();
 let loaded = false;
 
@@ -17,28 +21,52 @@ function loadOnce() {
   if (loaded) return;
   loaded = true;
 
-  const dir = path.join(process.cwd(), "media", "waiting");
-  if (!fs.existsSync(dir)) {
-    console.warn("[waitingClips] directory not found:", dir);
-    return;
-  }
-
-  const files = fs.readdirSync(dir);
-  for (const f of files) {
-    if (!f.endsWith(".ulaw")) continue;
-    const id = path.basename(f, ".ulaw");
-    const full = path.join(dir, f);
-    const buf = fs.readFileSync(full);
-
-    const frames: Buffer[] = [];
-    for (let off = 0; off < buf.length; off += FRAME_BYTES) {
-      frames.push(buf.subarray(off, off + FRAME_BYTES));
+  try {
+    if (!fs.existsSync(CLIPS_DIR)) {
+      console.warn("[waitingClips] directory not found:", CLIPS_DIR);
+      return;
     }
 
-    clips.set(id, { id, frames });
-  }
+    const files = fs.readdirSync(CLIPS_DIR);
 
-  console.log("[waitingClips] loaded", clips.size, "clips from", dir);
+    for (const f of files) {
+      if (!f.toLowerCase().endsWith(".ulaw")) continue;
+
+      const id = path.basename(f, ".ulaw");
+      const full = path.join(CLIPS_DIR, f);
+      const buf = fs.readFileSync(full);
+
+      const frames: Buffer[] = [];
+
+      for (let off = 0; off < buf.length; off += FRAME_BYTES) {
+        const remaining = buf.length - off;
+
+        if (remaining >= FRAME_BYTES) {
+          // פריים מלא
+          frames.push(buf.subarray(off, off + FRAME_BYTES));
+        } else {
+          // פריים אחרון חלקי → מרפדים בשקט μ-law (0xff)
+          const padded = Buffer.alloc(FRAME_BYTES, 0xff);
+          buf.copy(padded, 0, off, off + remaining);
+          frames.push(padded);
+        }
+      }
+
+      clips.set(id, { id, frames });
+    }
+
+    console.log(
+      "[waitingClips] loaded",
+      clips.size,
+      "clips from",
+      CLIPS_DIR
+    );
+  } catch (err: any) {
+    console.error(
+      "[waitingClips] error while loading clips:",
+      err?.message || err
+    );
+  }
 }
 
 export function getWaitingClipIds(): string[] {
@@ -54,6 +82,7 @@ export async function playWaitingClip(
   signal?: AbortSignal
 ): Promise<"ok" | "canceled"> {
   loadOnce();
+
   const clip = clips.get(id);
   if (!clip) {
     console.warn("[waitingClips] missing clip", id);
@@ -68,7 +97,9 @@ export async function playWaitingClip(
   };
 
   if (signal) {
-    if (signal.aborted) return "canceled";
+    if (signal.aborted) {
+      return "canceled";
+    }
     signal.addEventListener("abort", onAbort, { once: true });
   }
 
@@ -87,11 +118,22 @@ export async function playWaitingClip(
       );
 
       if (pacerMs > 0) {
-        await new Promise((r) => setTimeout(r, pacerMs));
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, pacerMs)
+        );
       }
     }
+  } catch (err: any) {
+    console.error(
+      "[waitingClips] error while streaming clip",
+      id,
+      ":",
+      err?.message || err
+    );
   } finally {
-    if (signal) signal.removeEventListener("abort", onAbort);
+    if (signal) {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   return canceled ? "canceled" : "ok";
