@@ -17,7 +17,7 @@ const BARGE_IN_MIN_CHARS =
     : 3;
 
 const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10");
-// תיקון: PACER_MS יקבל או TTS_PACER_MS או PACER_MS
+// PACER_MS יקבל או TTS_PACER_MS או PACER_MS
 const PACER_MS = Number(
   process.env.TTS_PACER_MS || process.env.PACER_MS || "20"
 );
@@ -30,7 +30,7 @@ const LLM_PREVIEW_WAIT_MS = Number(
   process.env.LLM_PREVIEW_WAIT_MS || "300"
 );
 
-// STT engine selector; default to v1 unless recognizer is provided
+// STT engine selector; בפועל: ברירת מחדל v1 אלא אם STT_ENGINE=v2 וגם יש recognizer
 const STT_ENGINE = String(process.env.STT_ENGINE || "").toLowerCase(); // "v1" | "v2"
 const V2_RECOGNIZER = process.env.GC_STT_RECOGNIZER || ""; // projects/{proj}/locations/{loc}/recognizers/{id or _}
 const V2_API_ENDPOINT =
@@ -76,7 +76,8 @@ function envVoiceSettings() {
   }
 
   const boost = bool("XI_SPEAKER_BOOST", false);
-  if (boost && process.env.DEFAULT_MODEL !== "eleven_v3") {
+  // תיקון: speaker boost רלוונטי דווקא ל-eleven_v3, לא להפך
+  if (boost && DEFAULT_MODEL === "eleven_v3") {
     vs.use_speaker_boost = true;
   }
 
@@ -271,7 +272,6 @@ export function attachTwilioWs(server: http.Server) {
           const dt = Math.round(performance.now() - t0);
           console.log("[LLM preview done] ms=", dt, "reply=", reply);
           latestPreviewReply = reply;
-          // גם כאן ה-LLM יכול לעדכן waiting_hint, זה בסדר – האחרון תמיד מנצח
           return reply;
         } catch (e: any) {
           console.error("[LLM preview error]", e?.message || e);
@@ -349,11 +349,21 @@ export function attachTwilioWs(server: http.Server) {
         await waitPromise.catch(() => {});
       }
 
-      // בשלב הזה יש לנו reply סופי (מ-preview או מפולבאק) → לעדכן waiting_hint לסיבוב הבא
-      const hintFromLlm = llm.getWaitingHint();
-      if (hintFromLlm && hintFromLlm.trim()) {
-        nextWaitingHint = hintFromLlm.trim();
-        console.log("[LLM] updated waiting_hint:", nextWaitingHint);
+      // בשלב הזה יש לנו reply סופי (מ-preview או מפולבאק) → לנסות לעדכן waiting_hint לסיבוב הבא
+      try {
+        const maybeFn = (llm as any).getWaitingHint;
+        if (typeof maybeFn === "function") {
+          const hintFromLlm = maybeFn.call(llm);
+          if (typeof hintFromLlm === "string" && hintFromLlm.trim()) {
+            nextWaitingHint = hintFromLlm.trim();
+            console.log("[LLM] updated waiting_hint:", nextWaitingHint);
+          }
+        }
+      } catch (e: any) {
+        console.error(
+          "[LLM] getWaitingHint error:",
+          e?.message || e
+        );
       }
 
       if (!streamSid) return;
