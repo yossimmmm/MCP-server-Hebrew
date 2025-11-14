@@ -18,8 +18,13 @@ type V2Opts = {
   apiEndpoint?: string;
   languageCode?: string;
   interimResults?: boolean;
-  decodingConfig?: DecodingConfig;
+  decodingConfig?: {
+    encoding: "MULAW" | "LINEAR16";
+    sampleRateHertz: number;
+    audioChannelCount?: number;
+  };
 } & V2Callbacks;
+
 
 export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
   const {
@@ -30,7 +35,7 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
     onData,
     onError,
     onEnd,
-  } = opts;
+} = opts;
 
   const client = new speech.SpeechClient(
     apiEndpoint ? { apiEndpoint } : undefined
@@ -82,21 +87,20 @@ export function createHebrewChirp3Stream(recognizer: string, opts: V2Opts) {
 
   const streamingConfig = {
     config: {
-      languageCodes: [languageCode],
-      model: "chirp_3",
-      explicitDecodingConfig:
-        decodingConfig ?? {
-          encoding: "MULAW",
-          sampleRateHertz: 8000,
-          audioChannelCount: 1,
-        },
-      features: {
-        enableAutomaticPunctuation: true,
-      },
+    languageCodes: [languageCode],
+    model: "chirp_3",
+    explicitDecodingConfig: decodingConfig ?? {
+      encoding: "MULAW",
+      sampleRateHertz: 8000,
+      audioChannelCount: 1,
     },
-    streamingFeatures: {
-      interimResults,
+    features: {
+      enableAutomaticPunctuation: true,
     },
+  },
+  streamingFeatures: {
+    interimResults,
+  },
   };
 
   let destroyed = false;
