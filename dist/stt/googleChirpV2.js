@@ -2,7 +2,7 @@
 import { v2 as speech } from "@google-cloud/speech";
 import { createFinalDeduper } from "../sttDedup.js";
 export function createHebrewChirp3Stream(recognizer, opts) {
-    const { apiEndpoint = process.env.SPEECH_V2_ENDPOINT, languageCode = process.env.STT_LANGUAGE_CODE || "iw-IL", interimResults = true, onData, onError, onEnd, } = opts;
+    const { apiEndpoint = process.env.SPEECH_V2_ENDPOINT, languageCode = process.env.STT_LANGUAGE_CODE || "iw-IL", interimResults = true, decodingConfig, onData, onError, onEnd, } = opts;
     const client = new speech.SpeechClient(apiEndpoint ? { apiEndpoint } : undefined);
     const eouMs = Number(process.env.STT_EOU_MS || "750");
     const eouGuardMs = Number(process.env.STT_EOU_GUARD_MS || "500");
@@ -46,7 +46,7 @@ export function createHebrewChirp3Stream(recognizer, opts) {
         config: {
             languageCodes: [languageCode],
             model: "chirp_3",
-            explicitDecodingConfig: {
+            explicitDecodingConfig: decodingConfig ?? {
                 encoding: "MULAW",
                 sampleRateHertz: 8000,
                 audioChannelCount: 1,
@@ -125,12 +125,14 @@ export function createHebrewChirp3Stream(recognizer, opts) {
         recognizer,
         streamingConfig,
     });
+    // השם "writeMuLawBase64" נשאר היסטורית – בפועל אפשר לשלוח גם MULAW וגם LINEAR16,
+    // כל עוד explicitDecodingConfig מתאים למה שאתה שולח.
     function writeMuLawBase64(b64) {
         if (destroyed)
             return;
         try {
-            const ulaw = Buffer.from(b64, "base64");
-            recognizeStream.write({ audio: ulaw });
+            const audioBuf = Buffer.from(b64, "base64");
+            recognizeStream.write({ audio: audioBuf });
         }
         catch (e) {
             destroyed = true;

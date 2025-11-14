@@ -2,6 +2,7 @@
 import express from "express";
 import cors from "cors";
 import { Readable } from "node:stream";
+import { attachWidgetRoutes } from "../widget/widgetRoutes.js"; // ⬅️ NEW
 const XI_API = process.env.XI_API_BASE ?? "https://api.elevenlabs.io/v1";
 function parseVoiceSettings(input) {
     if (!input)
@@ -18,7 +19,11 @@ export function createHttpApp() {
     const app = express();
     app.disable("x-powered-by");
     app.use(cors({ origin: "*", maxAge: 600 }));
+    // ⬅️ allow JSON bodies for widget API
+    app.use(express.json({ limit: "1mb" }));
+    // health
     app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+    // === existing TTS stream endpoint (unchanged, just kept as-is) ===
     app.get("/stream/tts", async (req, res) => {
         const apiKey = process.env.ELEVENLABS_API_KEY;
         if (!apiKey) {
@@ -35,15 +40,14 @@ export function createHttpApp() {
             });
         }
         const model = String(req.query.model ?? process.env.DEFAULT_MODEL ?? "eleven_v3");
-        // Telephony-safe default
+        // Telephony default stays ulaw_8000,
+        // widget will override with output_format=opus_48000_128 or pcm_48000
         const output_format = String(req.query.output_format ??
             process.env.DEFAULT_OUTPUT_FORMAT ??
             "ulaw_8000");
-        // ElevenLabs expects "he" for Hebrew
         const language_code = String(req.query.language_code ?? "he");
         const voice_settings = parseVoiceSettings(req.query.voice_settings);
         const qs = new URLSearchParams({ output_format });
-        // Don't set optimize_streaming_latency for v3
         const optLat = req.query.optimize_streaming_latency ??
             process.env.OPTIMIZE_STREAMING_LATENCY;
         if (!model.startsWith("eleven_v3") && optLat != null) {
@@ -56,7 +60,6 @@ export function createHttpApp() {
             language_code,
             ...(voice_settings ? { voice_settings } : {}),
         };
-        // Abort upstream if client disconnects
         const controller = new AbortController();
         const abortUpstream = () => controller.abort();
         req.on("close", abortUpstream);
@@ -68,7 +71,7 @@ export function createHttpApp() {
                 headers: {
                     "xi-api-key": apiKey,
                     "content-type": "application/json",
-                    accept: "*/*", // ulaw/pcm/mp3
+                    accept: "*/*",
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal,
@@ -86,10 +89,9 @@ export function createHttpApp() {
                     msg,
                 });
             }
-            // Stream pass-through
             res.setHeader("Content-Type", ct || "application/octet-stream");
             res.setHeader("Cache-Control", "no-store");
-            res.setHeader("X-Accel-Buffering", "no"); // disable buffering (nginx)
+            res.setHeader("X-Accel-Buffering", "no");
             res.setHeader("Connection", "keep-alive");
             res.flushHeaders?.();
             const nodeReadable = Readable.fromWeb(upstream.body);
@@ -117,6 +119,8 @@ export function createHttpApp() {
             req.off?.("aborted", abortUpstream);
         }
     });
+    // ⬅️ attach the widget API + JS
+    attachWidgetRoutes(app);
     return app;
 }
 export default createHttpApp;

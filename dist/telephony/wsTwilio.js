@@ -4,19 +4,23 @@ import speakTextToTwilio from "../tts/elevenToTwilio.js";
 import { createGoogleSession } from "../stt/google.js";
 import { createHebrewChirp3Stream } from "../stt/googleChirpV2.js";
 import { LlmSession } from "../nlu/gemini.js";
+import { pickWaitingPhraseForHint } from "../nlu/waitingPhrases.js";
+import { playWaitingClip } from "../tts/staticWaitingClips.js";
 // נורמליזציה: גם אם ב-env כתוב 12, בפועל עובדים בין 3 ל-5
 const RAW_BARGE_IN_MIN_CHARS = Number(process.env.BARGE_IN_MIN_CHARS || "5");
 const BARGE_IN_MIN_CHARS = Number.isFinite(RAW_BARGE_IN_MIN_CHARS)
     ? Math.max(3, Math.min(RAW_BARGE_IN_MIN_CHARS, 5))
     : 3;
 const TTS_START_FRAMES = Number(process.env.TTS_START_FRAMES || "10");
-const PACER_MS = Number(process.env.TTS_PACER_MS || process.env.TTS_PACER_MS || "20");
+// PACER_MS יקבל או TTS_PACER_MS או PACER_MS
+const PACER_MS = Number(process.env.TTS_PACER_MS || process.env.PACER_MS || "20");
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "eleven_v3";
 const DEFAULT_LANG = process.env.TTS_LANGUAGE_CODE || "he";
 const CALL_GREETING = process.env.CALL_GREETING || "";
 // כמה זמן לחכות ל-preview שרץ לפני שנופלים לפולבאק (ms)
 const LLM_PREVIEW_WAIT_MS = Number(process.env.LLM_PREVIEW_WAIT_MS || "300");
-// STT engine selector; default to v1 unless recognizer is provided
+const WAITING_DELAY_MS = Number(process.env.WAITING_DELAY_MS || "900");
+// STT engine selector; בפועל: ברירת מחדל v1 אלא אם STT_ENGINE=v2 וגם יש recognizer
 const STT_ENGINE = String(process.env.STT_ENGINE || "").toLowerCase(); // "v1" | "v2"
 const V2_RECOGNIZER = process.env.GC_STT_RECOGNIZER || ""; // projects/{proj}/locations/{loc}/recognizers/{id or _}
 const V2_API_ENDPOINT = process.env.GC_STT_API_ENDPOINT || deriveEndpointFromRecognizer(V2_RECOGNIZER);
@@ -48,12 +52,12 @@ function envVoiceSettings() {
         vs.style = clamp01(style);
     }
     const boost = bool("XI_SPEAKER_BOOST", false);
-    if (boost && process.env.DEFAULT_MODEL !== "eleven_v3") {
+    // תיקון: speaker boost רלוונטי דווקא ל-eleven_v3, לא להפך
+    if (boost && DEFAULT_MODEL === "eleven_v3") {
         vs.use_speaker_boost = true;
     }
     const rate = num("XI_SPEAKING_RATE");
     if (rate != null && !Number.isNaN(rate)) {
-        // נשאיר את זה כמו שהוא אצלך – אם תרצה נעשה טיונינג מהיר בקובץ נפרד
         vs.speaking_rate = rate;
     }
     return Object.keys(vs).length ? vs : undefined;
@@ -94,6 +98,9 @@ export function attachTwilioWs(server) {
         let latestPreviewText = "";
         let latestPreviewReply = "";
         let llmInFlight = null;
+        // hint למשפט ההמתנה הבא (שהLLM חוזה)
+        let nextWaitingHint = null;
+        // השמעת טקסט רגיל דרך ElevenLabs
         const speak = async (text) => {
             if (closed)
                 return;
@@ -129,6 +136,62 @@ export function attachTwilioWs(server) {
             }
             finally {
                 ttsAbort = undefined;
+            }
+        };
+        // השמעת קליפ המתנה סטטי אחת (כן בטח / מעולה וכו')
+        // play a single static waiting clip (e.g. "כן בטח!" etc.)
+        const playWaiting = async (hint) => {
+            if (closed)
+                return;
+            if (!streamSid)
+                return;
+            const phrase = pickWaitingPhraseForHint(hint ?? undefined);
+            if (!phrase)
+                return;
+            // cancel any current TTS (reply or previous waiting clip)
+            try {
+                ttsAbort?.abort();
+            }
+            catch {
+                // ignore
+            }
+            const abortController = new AbortController();
+            ttsAbort = abortController;
+            const signal = abortController.signal;
+            const delayMs = WAITING_DELAY_MS > 0 ? WAITING_DELAY_MS : 0;
+            // delay before starting the waiting clip, but allow abort during the delay
+            if (delayMs > 0) {
+                await new Promise((resolve) => {
+                    const timer = setTimeout(resolve, delayMs);
+                    const onAbort = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    if (signal.aborted) {
+                        clearTimeout(timer);
+                        resolve();
+                    }
+                    else {
+                        signal.addEventListener("abort", onAbort, { once: true });
+                    }
+                });
+                if (signal.aborted || closed || !streamSid) {
+                    return;
+                }
+            }
+            try {
+                console.log("[WAIT] playing waiting clip:", phrase.id, "| text=", phrase.text);
+                await playWaitingClip(ws, streamSid, phrase.id, seqRef, signal);
+            }
+            catch (e) {
+                if (e?.name !== "AbortError") {
+                    console.error("[WAIT] error:", e?.message || e);
+                }
+            }
+            finally {
+                if (!signal.aborted) {
+                    ttsAbort = undefined;
+                }
             }
         };
         // PARTIAL → להרים preview + barge-in
@@ -175,7 +238,7 @@ export function attachTwilioWs(server) {
                 }
             })();
         }
-        // FINAL → להשתמש ב-preview אם אפשר, אחרת פולבאק מלא
+        // FINAL → להשתמש ב-preview אם אפשר, אחרת פולבאק מלא + waiting clip
         async function handleFinalText(finalText) {
             const cleaned = (finalText || "").trim();
             if (!cleaned)
@@ -211,10 +274,30 @@ export function attachTwilioWs(server) {
             };
             let reply = await tryUsePreview();
             if (!reply) {
+                // אין preview מוכן → מריצים LLM + קליפ המתנה במקביל
+                const hintToUseNow = nextWaitingHint;
+                const waitPromise = streamSid
+                    ? playWaiting(hintToUseNow)
+                    : Promise.resolve();
                 const t0 = performance.now();
                 reply = await llm.reply(cleaned);
                 const dt = Math.round(performance.now() - t0);
                 console.log("[LLM final ms]", dt);
+                await waitPromise.catch(() => { });
+            }
+            // בשלב הזה יש לנו reply סופי (מ-preview או מפולבאק) → לנסות לעדכן waiting_hint לסיבוב הבא
+            try {
+                const maybeFn = llm.getWaitingHint;
+                if (typeof maybeFn === "function") {
+                    const hintFromLlm = maybeFn.call(llm);
+                    if (typeof hintFromLlm === "string" && hintFromLlm.trim()) {
+                        nextWaitingHint = hintFromLlm.trim();
+                        console.log("[LLM] updated waiting_hint:", nextWaitingHint);
+                    }
+                }
+            }
+            catch (e) {
+                console.error("[LLM] getWaitingHint error:", e?.message || e);
             }
             if (!streamSid)
                 return;
@@ -328,6 +411,13 @@ export function attachTwilioWs(server) {
         ws.on("error", (err) => {
             console.error("[twilio][ws] error:", err?.message || err);
             cleanup();
+        });
+        wss.on("connection", (ws, req) => {
+            console.log(`[twilio][ws] connection opened ${now()} from ${req.socket.remoteAddress}`);
+            ws.on("close", (code, reason) => {
+                console.log("[twilio][ws] closed code=", code, "reason=", reason.toString());
+                cleanup();
+            });
         });
         function cleanup() {
             if (closed)
