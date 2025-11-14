@@ -1,109 +1,74 @@
 // src/nlu/waitingPhrases.ts
+
 export type WaitingPhrase = {
-  id: string;          // שם הקובץ ב-media/waiting (ללא סיומת)
-  text: string;        // המשפט המקורי שהקלטנו
-  weight: number;      // משקל לבחירה רנדומלית
-  aliases?: string[];  // וריאציות טקסט דומות
+  id: string;        // file name in media/waiting (without extension)
+  text: string;      // full text, can include tone tags like [happy]
+  aliases?: string[]; // optional textual variants (used only for matching)
 };
 
 export const WAITING_PHRASES: WaitingPhrase[] = [
-  {
-    id: "ken_betah",
-    text: "כן בטח.",
-    weight: 3,
-    aliases: ["כן בטח", "כן בטח?", "כן, בטח"]
-  },
-  {
-    id: "meule",
-    text: "מעולה.",
-    weight: 3,
-    aliases: ["מעולה", "מעולה!", "מעולה לגמרי"]
-  },
-  {
-    id: "meule_check",
-    text: "מעולה, תן לי רגע לבדוק משהו קטן.",
-    weight: 4,
-    aliases: [
-      "מעולה, תן לי רגע לבדוק",
-      "מעולה, אני בודק רגע",
-      "מעולה, שניה אני בודק משהו קטן",
-      "מעולה, אני מציץ רגע"
-    ]
-  },
-  {
-    id: "sababa_check",
-    text: "סבבה, שניה אני בודק משהו קטן.",
-    weight: 4,
-    aliases: [
-      "סבבה, שניה אני בודק",
-      "סבבה, אני בודק רגע",
-      "סבבה, תן לי שניה לבדוק"
-    ]
-  },
-  {
-    id: "nice_organize",
-    text: "אחלה, אני עושה לך רגע סדר בראש.",
-    weight: 3,
-    aliases: [
-      "אחלה, אני עושה רגע סדר",
-      "אחלה, אני מסדר לך את זה רגע",
-      "אני עושה לך רגע סדר"
-    ]
-  },
-  {
-    id: "cool_look",
-    text: "מגניב, אני מציץ רגע על מה שסיפרת.",
-    weight: 2,
-    aliases: [
-      "מגניב, אני מציץ רגע",
-      "מגניב, אני בודק את זה רגע",
-      "מגניב, אני עובר על זה רגע"
-    ]
-  },
-  {
-    id: "ok_one_sec",
-    text: "טוב, תן לי שניה לחשוב על זה.",
-    weight: 2,
-    aliases: [
-      "טוב, תן לי שניה לחשוב",
-      "רק שניה אני חושב על זה",
-      "תן לי שניה לחשוב על זה"
-    ]
-  }
+  { id: "p_01", text: "[happy] כן בטח!" },
+  { id: "p_02", text: "[happy] נשמע מעולה!" },
+  { id: "p_03", text: "[bright] איזה יופי!" },
+  { id: "p_04", text: "[upbeat] אחלה, מתאים לגמרי!" },
+  { id: "p_05", text: "[happy] יופי, זה נשמע מצוין." },
+  { id: "p_06", text: "[calm] אין בעיה." },
+  { id: "p_07", text: "[neutral] נשמע טוב." },
+  { id: "p_08", text: "[calm] בסדר גמור." },
+  { id: "p_09", text: "[neutral] אוקיי, מבין." },
+  { id: "p_10", text: "[neutral] סבבה." },
+  { id: "p_16", text: "[friendly] אהבתי!" },
+  { id: "p_17", text: "[warm] אחלה דבר אמרת." },
+  { id: "p_18", text: "[warm] יופי, זה מסתדר לי." },
+  { id: "p_19", text: "[friendly] מבין אותך לגמרי." },
+  { id: "p_20", text: "[warm] תענוג לשמוע." },
+  { id: "p_21", text: "[upbeat] יאללה סבבה!" },
+  { id: "p_22", text: "[friendly] ברור אחי." },
+  { id: "p_23", text: "[bright] וואלה יפה!" },
+  { id: "p_24", text: "[happy] מגניב בטירוף!" },
+  { id: "p_25", text: "[friendly] אחלה של דבר." },
+  { id: "p_26", text: "[happy] מעולה!" },
+  { id: "p_27", text: "[neutral] כן." },
+  { id: "p_28", text: "[friendly] יופי." },
+  { id: "p_29", text: "[calm] בסדר." },
+  { id: "p_30", text: "[bright] סגור!" },
 ];
 
+// normalize for fuzzy matching (used when LLM returns text, not id)
 function normalizeHint(s: string): string {
   return (s || "")
+    // remove leading [tag] if exists
+    .replace(/^\s*\[[^\]]+\]\s*/, "")
     .toLowerCase()
-    .replace(/[.,!?;:"'׳״()\-–—]/g, "")
+    .replace(/[.,!?;:"'׳״()\[\]\-–—]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-// בחירה רנדומלית לפי weight
-export function pickWaitingPhrase(): WaitingPhrase {
-  const total = WAITING_PHRASES.reduce(
-    (sum, p) => sum + (p.weight > 0 ? p.weight : 1),
-    0
-  );
-  let r = Math.random() * total;
-
-  for (const p of WAITING_PHRASES) {
-    const w = p.weight > 0 ? p.weight : 1;
-    r -= w;
-    if (r <= 0) return p;
-  }
-
-  return WAITING_PHRASES[0];
-}
-
-// בחירת משפט לפי hint מה-LLM (או נפילה לרנדום אם אין התאמה)
+/**
+ * Map LLM hint → WaitingPhrase.
+ *
+ * Behavior:
+ * 1. If the hint matches an id exactly (e.g. "p_01") → return that phrase.
+ * 2. Otherwise, try to match by text / aliases (Hebrew phrase).
+ * 3. If nothing matches → return null (no random fallback).
+ */
 export function pickWaitingPhraseForHint(
   hint?: string | null
-): WaitingPhrase {
-  const normHint = normalizeHint(hint || "");
-  if (!normHint) return pickWaitingPhrase();
+): WaitingPhrase | null {
+  if (!hint) return null;
 
+  const raw = hint.trim();
+  if (!raw) return null;
+
+  // direct id match: "p_01", "p_02", ...
+  const byId = WAITING_PHRASES.find((p) => p.id === raw);
+  if (byId) return byId;
+
+  const normHint = normalizeHint(raw);
+  if (!normHint) return null;
+
+  // text / aliases match (LLM returns the phrase itself)
   for (const p of WAITING_PHRASES) {
     const variants = [p.text, ...(p.aliases ?? [])];
     for (const v of variants) {
@@ -119,6 +84,6 @@ export function pickWaitingPhraseForHint(
     }
   }
 
-  // לא מצאנו – פשוט רנדום
-  return pickWaitingPhrase();
+  // no random fallback – if there is no clear match, we prefer "no clip"
+  return null;
 }

@@ -5,6 +5,11 @@ import { WAITING_PHRASES } from "../src/nlu/waitingPhrases.js";
 
 const XI_API = process.env.XI_API_BASE ?? "https://api.elevenlabs.io/v1";
 
+function stripLeadingTag(text: string): string {
+  // remove leading [tag] if exists, keep the Hebrew phrase clean
+  return text.replace(/^\s*\[[^\]]+\]\s*/, "").trim();
+}
+
 async function renderOne(id: string, text: string) {
   const apiKey = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
@@ -17,8 +22,11 @@ async function renderOne(id: string, text: string) {
     voiceId
   )}/stream?${qs.toString()}`;
 
+  // strip [happy] / [bright] etc before sending to TTS
+  const spokenText = stripLeadingTag(text);
+
   const body = {
-    text,
+    text: spokenText,
     model_id: process.env.DEFAULT_MODEL || "eleven_v3",
     language_code: "he",
   };
