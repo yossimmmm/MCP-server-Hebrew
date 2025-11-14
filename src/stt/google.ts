@@ -22,29 +22,39 @@ function makeSpeechClient(): SpeechClient {
       : undefined);
 
   if (rawJson) {
-    const c = JSON.parse(rawJson);
-    const private_key = String(c.private_key || "");
-    const client_email = String(c.client_email || "");
-    const project_id = String(c.project_id || "");
-
-    // Normalize only line endings; do NOT rewrap/trim the PEM content
-    const pem = private_key.replace(/\r\n/g, "\n").replace(/\\n/g, "\n");
-
-    // Validate early so we throw a clear error instead of gRPC’s DECODER message
     try {
-      createPrivateKey({ key: pem, format: "pem" });
-    } catch (e: any) {
-      throw new Error(`[STT] Invalid private_key in credentials: ${e?.message || e}`);
-    }
+      const c = JSON.parse(rawJson);
+      const private_key = String(c.private_key || "");
+      const client_email = String(c.client_email || "");
+      const project_id = String(c.project_id || "");
 
-    console.log("[STT] Using credentials from GOOGLE_CREDENTIALS_* env");
-    return new SpeechClient({
-      projectId: project_id || undefined,
-      credentials: { client_email, private_key: pem },
-    });
+      const pem = private_key.replace(/\r\n/g, "\n").replace(/\\n/g, "\n");
+
+      try {
+        createPrivateKey({ key: pem, format: "pem" });
+      } catch (e: any) {
+        console.error(
+          "[STT] Invalid private_key in credentials, falling back to ADC:",
+          e?.message || e
+        );
+        // ממשיך לפולבאק למטה
+      }
+
+      console.log("[STT] Using credentials from GOOGLE_CREDENTIALS_* env");
+      return new SpeechClient({
+        projectId: project_id || undefined,
+        credentials: { client_email, private_key: pem },
+      });
+    } catch (e: any) {
+      console.error(
+        "[STT] Failed to parse GOOGLE_CREDENTIALS_* JSON, falling back to ADC:",
+        e?.message || e
+      );
+      // ניפול ל־ADC למטה
+    }
   }
 
-  console.warn("[STT] No explicit credentials found; falling back to ADC");
+  console.warn("[STT] No explicit credentials found or they failed; falling back to ADC");
   return new SpeechClient();
 }
 

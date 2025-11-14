@@ -530,19 +530,24 @@ const PRODUCT_CATALOG_RAW = `
 
 export class LlmSession {
   private history: Turn[] = [];
-  private memory: string | null = null; // סיכום דחוס של השיחה
-  private waitingHint: string | null = null; // משפט ההמתנה הבא שהמודל חוזה
+  private memory: string | null = null;
+  private waitingHint: string | null = null;
   private readonly apiKey: string;
   private readonly model: string;
 
   constructor() {
     this.apiKey = process.env.GEMINI_API_KEY || "";
-    if (!this.apiKey) {
-      throw new Error("GEMINI_API_KEY is not set");
-    }
     this.model = process.env.LLM_MODEL || "gemini-2.5-flash-lite";
-    console.log("[LLM] using model:", this.model);
+
+    if (!this.apiKey) {
+      console.error(
+        "[LLM] GEMINI_API_KEY is not set – running in fallback mode without Gemini calls"
+      );
+    } else {
+      console.log("[LLM] using model:", this.model);
+    }
   }
+
 
   // מאפשר ל-wsTwilio לקרוא את ה-waiting_hint האחרון
   getWaitingHint(): string | null {
@@ -657,6 +662,15 @@ export class LlmSession {
       return fallback;
     }
 
+    if (!this.apiKey) {
+      const fallback =
+        "יש לי כרגע תקלה בחיבור למנוע החכם, אבל אני איתך. תנסה להסביר שוב בפשטות מה אתה צריך.";
+      this.history.push({ role: "user", text: cleaned });
+      this.history.push({ role: "assistant", text: fallback });
+      this.logIO(cleaned, fallback);
+      return fallback;
+    }
+    
     this.history.push({ role: "user", text: cleaned });
 
     const prompt = this.buildPrompt(cleaned);
