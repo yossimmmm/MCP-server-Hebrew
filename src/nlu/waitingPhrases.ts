@@ -1,8 +1,8 @@
 // src/nlu/waitingPhrases.ts
 
 export type WaitingPhrase = {
-  id: string;        // file name in media/waiting (without extension)
-  text: string;      // full text, can include tone tags like [happy]
+  id: string;         // file name in media/waiting (without extension)
+  text: string;       // full text, can include tone tags like [happy]
   aliases?: string[]; // optional textual variants (used only for matching)
 };
 
@@ -34,6 +34,14 @@ export const WAITING_PHRASES: WaitingPhrase[] = [
   { id: "p_30", text: "[bright] סגור!" },
 ];
 
+// extract leading tone tag: [happy] → "happy"
+function extractToneTag(s: string): string | null {
+  if (!s) return null;
+  const m = s.match(/^\s*\[([^\]]+)\]/);
+  if (!m) return null;
+  return m[1].trim().toLowerCase() || null;
+}
+
 // normalize for fuzzy matching (used when LLM returns text, not id)
 function normalizeHint(s: string): string {
   return (s || "")
@@ -50,8 +58,23 @@ function normalizeHint(s: string): string {
  *
  * Behavior:
  * 1. If the hint matches an id exactly (e.g. "p_01") → return that phrase.
- * 2. Otherwise, try to match by text / aliases (Hebrew phrase).
+ * 2. Otherwise, we:
+ *    - Parse an optional tone tag from the hint, e.g. "[happy] כן בטח!".
+ *    - Normalize the text part ("כן בטח").
+ *    - Scan all phrases (text + aliases) and score matches:
+ *        • +2 for exact normalized text match.
+ *        • +1 for partial text match (includes / included).
+ *        • +2 extra if tone tag from hint == tone tag of phrase.
+ *      The phrase with the highest score wins.
+ *      Ties are broken deterministically by the order in WAITING_PHRASES (לא אקראי).
  * 3. If nothing matches → return null (no random fallback).
+ *
+ * כדי לקבל בחירה לפי ה-[tone]:
+ * - אם יש כמה וריאציות של "כן בטח" עם טאגים שונים, למשל:
+ *     "[happy] כן בטח!", "[calm] כן בטח!"
+ *   תן ל-LLM להחזיר waiting_hint בסגנון:
+ *     "[happy] כן בטח!" או "[calm] כן בטח!"
+ *   ואז הפונקציה תבחר את הווריאציה עם אותו הטאג.
  */
 export function pickWaitingPhraseForHint(
   hint?: string | null
@@ -65,25 +88,53 @@ export function pickWaitingPhraseForHint(
   const byId = WAITING_PHRASES.find((p) => p.id === raw);
   if (byId) return byId;
 
-  const normHint = normalizeHint(raw);
+  const hintTone = extractToneTag(raw);     // e.g. "happy"
+  const normHint = normalizeHint(raw);     // e.g. "כן בטח"
+
   if (!normHint) return null;
 
-  // text / aliases match (LLM returns the phrase itself)
-  for (const p of WAITING_PHRASES) {
-    const variants = [p.text, ...(p.aliases ?? [])];
+  type Scored = {
+    phrase: WaitingPhrase;
+    score: number;
+    index: number;
+  };
+
+  let best: Scored | null = null;
+
+  WAITING_PHRASES.forEach((phrase, index) => {
+    const variants = [phrase.text, ...(phrase.aliases ?? [])];
+
     for (const v of variants) {
-      const nv = normalizeHint(v);
-      if (!nv) continue;
+      const vNorm = normalizeHint(v);
+      if (!vNorm) continue;
+
+      let score = 0;
+
+      if (vNorm === normHint) {
+        // exact text match
+        score = 2;
+      } else if (vNorm.includes(normHint) || normHint.includes(vNorm)) {
+        // partial text match
+        score = 1;
+      }
+
+      if (score === 0) continue;
+
+      const vTone = extractToneTag(v);
+      if (hintTone && vTone && vTone === hintTone) {
+        // tone tag match, e.g. both [happy]
+        score += 2;
+      }
+
       if (
-        nv === normHint ||
-        nv.includes(normHint) ||
-        normHint.includes(nv)
+        !best ||
+        score > best.score ||
+        (score === best.score && index < best.index)
       ) {
-        return p;
+        best = { phrase, score, index };
       }
     }
-  }
+  });
 
-  // no random fallback – if there is no clear match, we prefer "no clip"
-  return null;
+  return best ? best.phrase : null;
 }

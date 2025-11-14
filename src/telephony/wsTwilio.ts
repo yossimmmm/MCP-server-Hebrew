@@ -30,6 +30,10 @@ const LLM_PREVIEW_WAIT_MS = Number(
   process.env.LLM_PREVIEW_WAIT_MS || "300"
 );
 
+const WAITING_DELAY_MS = Number(
+  process.env.WAITING_DELAY_MS || "900"
+);
+
 // STT engine selector; בפועל: ברירת מחדל v1 אלא אם STT_ENGINE=v2 וגם יש recognizer
 const STT_ENGINE = String(process.env.STT_ENGINE || "").toLowerCase(); // "v1" | "v2"
 const V2_RECOGNIZER = process.env.GC_STT_RECOGNIZER || ""; // projects/{proj}/locations/{loc}/recognizers/{id or _}
@@ -184,6 +188,7 @@ export function attachTwilioWs(server: http.Server) {
     };
 
     // השמעת קליפ המתנה סטטי אחת (כן בטח / מעולה וכו')
+        // play a single static waiting clip (e.g. "כן בטח!" etc.)
     const playWaiting = async (hint?: string | null) => {
       if (closed) return;
       if (!streamSid) return;
@@ -191,13 +196,42 @@ export function attachTwilioWs(server: http.Server) {
       const phrase = pickWaitingPhraseForHint(hint ?? undefined);
       if (!phrase) return;
 
+      // cancel any current TTS (reply or previous waiting clip)
       try {
         ttsAbort?.abort();
       } catch {
         // ignore
       }
 
-      ttsAbort = new AbortController();
+      const abortController = new AbortController();
+      ttsAbort = abortController;
+
+      const signal = abortController.signal;
+
+      const delayMs = WAITING_DELAY_MS > 0 ? WAITING_DELAY_MS : 0;
+
+      // delay before starting the waiting clip, but allow abort during the delay
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delayMs);
+
+          const onAbort = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+
+          if (signal.aborted) {
+            clearTimeout(timer);
+            resolve();
+          } else {
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
+        });
+
+        if (signal.aborted || closed || !streamSid) {
+          return;
+        }
+      }
 
       try {
         console.log(
@@ -211,16 +245,19 @@ export function attachTwilioWs(server: http.Server) {
           streamSid,
           phrase.id,
           seqRef,
-          ttsAbort.signal
+          signal
         );
       } catch (e: any) {
         if (e?.name !== "AbortError") {
           console.error("[WAIT] error:", e?.message || e);
         }
       } finally {
-        ttsAbort = undefined;
+        if (!signal.aborted) {
+          ttsAbort = undefined;
+        }
       }
     };
+
 
     // PARTIAL → להרים preview + barge-in
     function handlePartialText(text: string) {
@@ -507,7 +544,7 @@ export function attachTwilioWs(server: http.Server) {
       console.error("[twilio][ws] error:", (err as any)?.message || err);
       cleanup();
     });
-    
+
     wss.on("connection", (ws, req) => {
       console.log(
         `[twilio][ws] connection opened ${now()} from ${req.socket.remoteAddress}`
