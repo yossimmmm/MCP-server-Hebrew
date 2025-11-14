@@ -507,6 +507,17 @@ export function attachTwilioWs(server: http.Server) {
       console.error("[twilio][ws] error:", (err as any)?.message || err);
       cleanup();
     });
+    
+    wss.on("connection", (ws, req) => {
+      console.log(
+        `[twilio][ws] connection opened ${now()} from ${req.socket.remoteAddress}`
+      );
+
+      ws.on("close", (code, reason) => {
+        console.log("[twilio][ws] closed code=", code, "reason=", reason.toString());
+        cleanup();
+      });
+    });
 
     function cleanup() {
       if (closed) return;

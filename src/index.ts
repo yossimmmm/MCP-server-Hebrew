@@ -38,8 +38,7 @@ app.post("/voice", twimlHandler());
 // אופציונלי: hook ל-status של ה-stream אם תרצה להשתמש
 app.post("/twilio/stream-status", (_req, res) => res.sendStatus(204));
 
-// ראוטים של ה-widget (HTTP)
-attachWidgetRoutes(app);
+
 
 // MCP HTTP endpoints (ל-debug / tooling)
 attachMcp(app, PUBLIC);
@@ -50,8 +49,7 @@ const server = http.createServer(app);
 // WebSocket ל-Twilio
 attachTwilioWs(server);
 
-// WebSocket ל-widget voice
-attachWidgetVoiceWs(server);
+
 
 // לוג על upgrade (לא חובה, עוזר ל-debug)
 server.on("upgrade", (req, _socket, _head) => {
