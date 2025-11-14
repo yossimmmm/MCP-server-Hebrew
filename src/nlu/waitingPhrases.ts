@@ -69,15 +69,19 @@ function extractToneTag(s: string): string | null {
 }
 
 // normalize for fuzzy matching (used when LLM returns text, not id)
+// normalize for fuzzy matching (used when LLM returns text, not id)
 function normalizeHint(s: string): string {
   return (s || "")
-    // remove leading [tag] if exists
-    .replace(/^\s*\[[^\]]+\]\s*/, "")
     .toLowerCase()
-    .replace(/[.,!?;:"'׳״()\[\]\-–—]/g, "")
+    // להוריד כל טאגים בסגנון [happy], [breath], [sigh] וכו' מכל מקום במחרוזת
+    .replace(/\[[^\]]+\]/g, "")
+    // לנקות סימני פיסוק בסיסיים
+    .replace(/[.,!?;:"'׳״()\-\–—]/g, "")
+    // לצמצם רווחים
     .replace(/\s+/g, " ")
     .trim();
 }
+
 
 /**
  * Map LLM hint → WaitingPhrase.
@@ -162,5 +166,9 @@ export function pickWaitingPhraseForHint(
     }
   });
 
+  if (!best) {
+    console.warn("[WAIT] no matching waiting phrase for hint:", hint);
+  }
+   
   return best ? best.phrase : null;
 }
