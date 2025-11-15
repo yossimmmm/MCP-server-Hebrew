@@ -562,7 +562,7 @@ export function attachWidgetRoutes(app: Express): void {
       }
 
       const sess = getOrCreateSession(sessionId);
-      const reply = await sess.llm.reply(cleaned);
+      const reply = await sess.llm.replyFinal(cleaned);
 
       const qs = new URLSearchParams({
         text: reply,

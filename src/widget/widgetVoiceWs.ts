@@ -80,7 +80,7 @@ export default function attachWidgetVoiceWs(server: http.Server): void {
             // לעדכן קליינט מה ה־sessionId הסופי
             safeSend({ type: "session", sessionId: sess.id });
 
-            const reply = await sess.llm.reply(text);
+            const reply = await sess.llm.replyFinal(text);
 
             const qs = new URLSearchParams({
               text: reply,
