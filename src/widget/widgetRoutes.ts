@@ -1,4 +1,3 @@
-// src/widget/widgetRoutes.ts
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "node:crypto";
 import { LlmSession } from "../nlu/gemini.js";
@@ -21,10 +20,10 @@ const API_BASE = (
   `http://localhost:${process.env.PORT ?? 8080}`
 ).replace(/\/+$/, "");
 
-// Optional: dedicated voice for the widget (not חובה)
+// Optional: dedicated voice for the widget
 const WIDGET_VOICE_ID = process.env.WIDGET_VOICE_ID ?? "";
 
-// Max characters per user message (מונע abuse)
+// Max characters per user message (abuse protection)
 const MAX_INPUT_CHARS = 1000;
 
 // ---- session management ----
@@ -34,12 +33,12 @@ export function getOrCreateSession(sessionId?: string | null): WidgetSession {
   if (sessionId) {
     const existing = SESSIONS.get(sessionId);
     if (existing) {
-      // אם עוד לא פג תוקף – מחזירים ומעדכנים last access
+      // Session not expired yet → update last access and return
       if (now - existing.createdAt < SESSION_TTL_MS) {
         existing.createdAt = now;
         return existing;
       }
-      // פג תוקף – מוחקים ויוצרים חדש
+      // Expired → delete and create a new one
       SESSIONS.delete(sessionId);
     }
   }
@@ -51,7 +50,7 @@ export function getOrCreateSession(sessionId?: string | null): WidgetSession {
   return session;
 }
 
-// ניקוי מחזורי של סשנים שפג תוקפם
+// Periodic cleanup of expired sessions
 setInterval(() => {
   const now = Date.now();
   for (const [id, sess] of SESSIONS) {
@@ -65,7 +64,7 @@ setInterval(() => {
 function buildWidgetBundle(): string {
   const apiBase = API_BASE;
 
-  // NOTE: keep this vanilla so it runs on any site, no bundler required
+  // Keep this vanilla so it runs on any site, no bundler required
   return `
 (function () {
   "use strict";
@@ -415,7 +414,7 @@ function buildWidgetBundle(): string {
           }
         };
 
-        // למנוע הד
+        // Prevent echo back into speakers
         const gain = ctx.createGain();
         gain.gain.value = 0;
         source.connect(processorNode);
@@ -525,7 +524,7 @@ function buildWidgetBundle(): string {
       }
     });
 
-    // optional initial system bubble
+    // Optional initial system bubble
     addMessage("system", "You are chatting with the FURNE voice agent.");
   }
 
