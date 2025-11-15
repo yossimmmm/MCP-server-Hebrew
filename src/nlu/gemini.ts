@@ -1,5 +1,4 @@
-// src/nlu/gemini.ts
-import { WAITING_PHRASES } from "./waitingPhrases.js";
+import { WAITING_PHRASES, pickWaitingPhraseForHint } from "./waitingPhrases.js";
 
 type Role = "user" | "assistant";
 
@@ -14,7 +13,7 @@ type LlmState = {
   waiting_hint?: string;
 };
 
-// ✂️ כאן אתה מדביק את הפרומפט הארוך שלך במקום PASTE PROMPT HERE
+// Paste your full system prompt here
 const SYSTEM_PROMPT = `
 אתה עוזר קולי בעברית בשיחת טלפון ללקוח של FURNE.
 
@@ -263,9 +262,8 @@ Guardrails כלליים
 - תמיד להחזיר JSON תקין בלבד, ללא טקסט חיצוני.
 `.trim();
 
-
-// ✂️ כאן אתה מדביק את רשימת המוצרים המלאה שלך, בפורמט כמו בדוגמה (מוצר / כל השדות / ...)
-// אם אין לך עדיין רשימה, תשאיר ריק. כשהוא ריק – פשוט לא נעביר קטלוג למודל.
+// Paste your full product catalog here (optional)
+// When empty, the model will not see any catalog.
 const PRODUCT_CATALOG_RAW = `
 מוצר
 
@@ -554,13 +552,17 @@ const PRODUCT_CATALOG_RAW = `
 מזהה מוצר: P-016
 מחיר: 1988
 תיאור: מזרן מבטון בגוון בז' בסגנון קלאסי. "מושלם" לחדר רחצה לפי ההגדרה. מיועד לשדרג את הנוחות היומיומית ולהיראות נהדר במשך שנים.
-
 `.trim();
 
 export class LlmSession {
   private history: Turn[] = [];
   private memory: string | null = null;
   private waitingHint: string | null = null;
+
+  // waiting clip state (for telephony layer)
+  private pendingWaitingClipId: string | null = null;
+  private lastWaitingClipId: string | null = null;
+
   private readonly apiKey: string;
   private readonly model: string;
 
@@ -577,32 +579,36 @@ export class LlmSession {
     }
   }
 
-
-  // מאפשר ל-wsTwilio לקרוא את ה-waiting_hint האחרון
+  // Allow external consumers (debugging / logging) to read latest waiting_hint
   getWaitingHint(): string | null {
     return this.waitingHint;
   }
 
-  // פונקציית עזר קטנה ללוג
+  // Read the pending waiting clip id (for the *next* turn) and clear it
+  getPendingWaitingClipIdAndClear(): string | null {
+    const id = this.pendingWaitingClipId;
+    this.pendingWaitingClipId = null;
+    return id ?? null;
+  }
+
+  // Logging helper
   private logIO(input: string, output?: string) {
     console.log("[LLM in ]", input);
     if (output != null) console.log("[LLM out]", output);
   }
 
-  // הורדת ```json ... ``` אם המודל שם תשובה בקוד-בלוק
+  // Strip ```json ... ``` fences if the model returns code blocks
   private stripCodeFence(text: string): string {
     if (!text) return "";
     const trimmed = text.trim();
     if (!trimmed.startsWith("```")) return trimmed;
 
-    // מוריד שורה ראשונה ```json או ``` וכדומה
     const withoutFirst = trimmed.replace(/^```[a-zA-Z0-9_-]*\s*\r?\n/, "");
-    // מוריד ``` בסוף
     const withoutLast = withoutFirst.replace(/\r?\n```$/, "");
     return withoutLast.trim();
   }
 
-  // חילוץ ערך של מפתח מתוך טקסט גולמי (fallback)
+  // Fallback extraction of a field from raw text if JSON parsing fails
   private extractFieldFromRaw(raw: string, key: string): string | null {
     if (!raw) return null;
     const lower = raw.toLowerCase();
@@ -618,22 +624,20 @@ export class LlmSession {
     let value = line.slice(colonIdx + 1).trim();
     if (!value) return null;
 
-    // להוריד סוגריים / פסיקים בסוף
     value = value.replace(/[,\}]+$/, "").trim();
-    // להוריד מרכאות מסביב אם יש
     value = value.replace(/^["']/, "").replace(/["']$/, "").trim();
 
     return value || null;
   }
 
-  // ניקוי פריפיקס כמו "reply:" וכדומה
+  // Remove prefixes like "reply:" from the reply text
   private stripReplyPrefix(text: string): string {
     return text
       .replace(/^\s*["']?\s*reply["']?\s*[:\-–]?\s*/i, "")
       .trim();
   }
 
-  // בונה prompt שמבקש JSON עם reply + memory + waiting_hint
+  // Build the full prompt for Gemini (system + waiting phrases + catalog + memory + user text)
   private buildPrompt(userText: string): string {
     const currentMemory =
       this.memory && this.memory.trim().length > 0
@@ -642,11 +646,11 @@ export class LlmSession {
 
     const lines: string[] = [];
 
-    // פרומפט בסיסי
+    // System prompt
     lines.push(SYSTEM_PROMPT);
     lines.push("");
 
-    // רשימת משפטי המתנה – שהמודל יבחר מהם ל-waiting_hint
+    // Waiting phrases list (for waiting_hint selection)
     if (WAITING_PHRASES.length > 0) {
       const waitingList = WAITING_PHRASES.map(
         (p, idx) => `${idx + 1}. "${p.text}"`
@@ -658,7 +662,7 @@ export class LlmSession {
       lines.push("");
     }
 
-    // קטלוג מוצרים מודבק (אם קיים)
+    // Product catalog (if provided)
     if (PRODUCT_CATALOG_RAW.trim()) {
       lines.push(
         "קטלוג המוצרים המלא שעומד לרשותך (אל תשנה את הטקסט, רק תשתמש בו כמידע להמלצות):"
@@ -667,7 +671,7 @@ export class LlmSession {
       lines.push("");
     }
 
-    // memory + הודעת הלקוח
+    // Memory + new user message
     lines.push("זיכרון השיחה הנוכחי (memory):");
     lines.push(currentMemory);
     lines.push("");
@@ -681,34 +685,14 @@ export class LlmSession {
     return lines.join("\n");
   }
 
-  async reply(userText: string): Promise<string> {
+  // Low-level call to Gemini that returns structured state (reply, memory, waiting_hint)
+  private async generate(userText: string): Promise<LlmState> {
     const cleaned = (userText || "").trim();
-
-    // אם באמת לא הגיע כלום – תשובה רכה פעם אחת
-    if (!cleaned) {
-      const fallback = "לא בטוח שהבנתי אותך, תנסה להגיד שוב?";
-      this.logIO(userText, fallback);
-      return fallback;
-    }
-
-    if (!this.apiKey) {
-      const fallback =
-        "יש לי כרגע תקלה בחיבור למנוע החכם, אבל אני איתך. תנסה להסביר שוב בפשטות מה אתה צריך.";
-      this.history.push({ role: "user", text: cleaned });
-      this.history.push({ role: "assistant", text: fallback });
-      this.logIO(cleaned, fallback);
-      return fallback;
-    }
-    
-    this.history.push({ role: "user", text: cleaned });
-
-    const prompt = this.buildPrompt(cleaned);
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
       this.model
     )}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
 
-    // טוקנים: אם LLM_MAX_TOKENS לא מוגדר / ריק → בלי הגבלה מפורשת
     const maxTokensEnv = process.env.LLM_MAX_TOKENS;
     const rawMax =
       maxTokensEnv != null && maxTokensEnv !== ""
@@ -725,6 +709,8 @@ export class LlmSession {
     if (Number.isFinite(rawMax) && rawMax > 0) {
       generationConfig.maxOutputTokens = rawMax;
     }
+
+    const prompt = this.buildPrompt(cleaned);
 
     const body = {
       contents: [
@@ -754,9 +740,14 @@ export class LlmSession {
       if (!res.ok) {
         const text = await res.text().catch(() => res.statusText);
         console.error("[LLM] HTTP error:", res.status, text);
-        const fallback = "הייתה תקלה קטנה רגע, תנסה שוב.";
+        const fallback =
+          "הייתה תקלה קטנה רגע, תנסה שוב.";
         this.logIO(cleaned, fallback);
-        return fallback;
+        return {
+          reply: fallback,
+          memory: this.memory ?? "",
+          waiting_hint: this.waitingHint ?? undefined,
+        };
       }
 
       const data: any = await res.json();
@@ -771,14 +762,13 @@ export class LlmSession {
 
       console.log("[LLM raw]", raw);
 
-      // ננקה קוד-בלוק אם יש
       const jsonText = this.stripCodeFence(raw);
 
       let replyText = jsonText;
       let newMemory = this.memory ?? "";
-      let newWaitingHint: string | null = this.waitingHint ?? null;
+      let newWaitingHint: string | undefined =
+        this.waitingHint ?? undefined;
 
-      // קודם כל מנסים JSON.parse על הטקסט הנקי
       try {
         const parsed = JSON.parse(jsonText) as Partial<LlmState>;
         if (typeof parsed.reply === "string" && parsed.reply.trim()) {
@@ -815,37 +805,117 @@ export class LlmSession {
         }
       }
 
-      // לעדכן memory ו-waitingHint אם יש משהו
-      if (newMemory && newMemory.trim()) {
-        this.memory = newMemory.trim();
-      }
-      if (newWaitingHint && newWaitingHint.trim()) {
-        this.waitingHint = newWaitingHint.trim();
-        console.log("[LLM waiting_hint]", this.waitingHint);
-      }
-
-      // לוודא שלא נשאר לנו "reply:" בהתחלה
       replyText = this.stripReplyPrefix(replyText);
 
       const finalReply =
         replyText ||
         "לא בטוח שהבנתי עד הסוף, תסביר שוב מה אתה רוצה שאני אעשה בשבילך?";
 
-      this.history.push({ role: "assistant", text: finalReply });
-      this.logIO(cleaned, finalReply);
-      return finalReply;
+      return {
+        reply: finalReply,
+        memory: newMemory,
+        waiting_hint: newWaitingHint,
+      };
     } catch (e: any) {
       if (e?.name === "AbortError") {
         console.error("[LLM] request aborted by timeout");
       } else {
         console.error("[LLM] request error:", e?.message || e);
       }
-      const fallback = "יש תקלה זמנית בצד שלי, תנסה שוב עוד רגע.";
+      const fallback =
+        "יש תקלה זמנית בצד שלי, תנסה שוב עוד רגע.";
       this.logIO(cleaned, fallback);
-      return fallback;
+      return {
+        reply: fallback,
+        memory: this.memory ?? "",
+        waiting_hint: this.waitingHint ?? undefined,
+      };
     } finally {
       if (timeout) clearTimeout(timeout);
     }
+  }
+
+  // PREVIEW: no history, no memory update, no waiting_hint / waiting clip logic
+  async replyPreview(userText: string): Promise<string> {
+    const cleaned = (userText || "").trim();
+
+    if (!cleaned) {
+      const fallback =
+        "לא בטוח שהבנתי אותך, תנסה להגיד שוב?";
+      this.logIO(userText, fallback);
+      return fallback;
+    }
+
+    if (!this.apiKey) {
+      const fallback =
+        "יש לי כרגע תקלה בחיבור למנוע החכם, אבל אני איתך. תנסה להסביר שוב בפשטות מה אתה צריך.";
+      this.logIO(cleaned, fallback);
+      return fallback;
+    }
+
+    const state = await this.generate(cleaned);
+    return state.reply;
+  }
+
+  // FINAL: updates history, memory, waiting_hint and pre-computes waiting clip id
+  async replyFinal(userText: string): Promise<string> {
+    const cleaned = (userText || "").trim();
+
+    if (!cleaned) {
+      const fallback =
+        "לא בטוח שהבנתי אותך, תנסה להגיד שוב?";
+      this.logIO(userText, fallback);
+      return fallback;
+    }
+
+    if (!this.apiKey) {
+      const fallback =
+        "יש לי כרגע תקלה בחיבור למנוע החכם, אבל אני איתך. תנסה להסביר שוב בפשטות מה אתה צריך.";
+      this.history.push({ role: "user", text: cleaned });
+      this.history.push({ role: "assistant", text: fallback });
+      this.logIO(cleaned, fallback);
+      return fallback;
+    }
+
+    this.history.push({ role: "user", text: cleaned });
+
+    const state = await this.generate(cleaned);
+
+    const newMemory =
+      typeof state.memory === "string" && state.memory.trim()
+        ? state.memory.trim()
+        : this.memory;
+    this.memory = newMemory ?? null;
+
+    const newWaiting =
+      typeof state.waiting_hint === "string" && state.waiting_hint.trim()
+        ? state.waiting_hint.trim()
+        : null;
+
+    if (newWaiting) {
+      this.waitingHint = newWaiting;
+      console.log("[LLM waiting_hint]", this.waitingHint);
+
+      // Map waiting_hint text/id → concrete clipId, with last-id awareness
+      const phrase = pickWaitingPhraseForHint(
+        this.waitingHint,
+        this.lastWaitingClipId
+      );
+      if (phrase) {
+        this.pendingWaitingClipId = phrase.id;
+        this.lastWaitingClipId = phrase.id;
+      } else {
+        this.pendingWaitingClipId = null;
+      }
+    } else {
+      this.waitingHint = null;
+      this.pendingWaitingClipId = null;
+    }
+
+    const finalReply = state.reply;
+    this.history.push({ role: "assistant", text: finalReply });
+    this.logIO(cleaned, finalReply);
+    return finalReply;
   }
 }
 
