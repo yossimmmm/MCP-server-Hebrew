@@ -1,3 +1,4 @@
+// src/telephony/wsTwilio.ts
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import { performance } from "node:perf_hooks";
@@ -218,6 +219,7 @@ export function attachTwilioWs(server: http.Server) {
       console.log("[FINAL handle] text=", cleaned);
 
       const tryUsePreview = async (): Promise<string> => {
+        // 1) If we already have a preview reply that clearly matches this final text → reuse immediately.
         if (latestPreviewReply && latestPreviewText) {
           if (isCloseEnough(cleaned, latestPreviewText)) {
             console.log("[LLM] using existing preview reply");
@@ -225,46 +227,58 @@ export function attachTwilioWs(server: http.Server) {
           }
         }
 
+        // 2) If there's an in-flight preview and it *might* match this final text, wait up to LLM_PREVIEW_WAIT_MS.
         if (llmInFlight) {
-          console.log(
-            "[LLM] waiting for in-flight preview up to",
-            LLM_PREVIEW_WAIT_MS,
-            "ms"
-          );
-          try {
-            const result = await Promise.race<string>([
-              llmInFlight,
-              new Promise<string>((resolve) =>
-                setTimeout(() => resolve(""), LLM_PREVIEW_WAIT_MS)
-              ),
-            ]);
+          if (
+            latestPreviewText &&
+            isCloseEnough(cleaned, latestPreviewText)
+          ) {
+            console.log(
+              "[LLM] waiting for in-flight preview up to",
+              LLM_PREVIEW_WAIT_MS,
+              "ms"
+            );
+            try {
+              const result = await Promise.race<string>([
+                llmInFlight,
+                new Promise<string>((resolve) =>
+                  setTimeout(() => resolve(""), LLM_PREVIEW_WAIT_MS)
+                ),
+              ]);
 
-            if (
-              result &&
-              latestPreviewReply &&
-              latestPreviewText &&
-              isCloseEnough(cleaned, latestPreviewText)
-            ) {
-              console.log(
-                "[LLM] in-flight preview finished in time, using preview reply"
+              if (
+                result &&
+                latestPreviewReply &&
+                latestPreviewText &&
+                isCloseEnough(cleaned, latestPreviewText)
+              ) {
+                console.log(
+                  "[LLM] in-flight preview finished in time, using preview reply"
+                );
+                return latestPreviewReply;
+              }
+            } catch (e: any) {
+              console.error(
+                "[LLM] error while waiting for preview:",
+                e?.message || e
               );
-              return latestPreviewReply;
             }
-          } catch (e: any) {
-            console.error(
-              "[LLM] error while waiting for preview:",
-              e?.message || e
+          } else {
+            // We know the final text diverged from the partial used for preview → no point waiting.
+            console.log(
+              "[LLM] in-flight preview text diverged from final text → skipping preview wait"
             );
           }
         }
 
+        // 3) No usable preview → fall back to full replyFinal.
         return "";
       };
 
       let reply = await tryUsePreview();
 
       if (!reply) {
-        // No preview ready → play waiting clip from previous turn (if any) and run final LLM
+        // No preview ready/usable → play waiting clip from previous turn (if any) and run final LLM
         const clipId = llm.getPendingWaitingClipIdAndClear();
         if (clipId) {
           console.log("[WAIT] enqueuing waiting clip id from LLM:", clipId);
