@@ -57,13 +57,25 @@ export class TtsQueue {
     this.processQueue();
   }
 
-  enqueueClip(clipId: string, delayMs?: number) {
-    if (this.closed) return;
-    if (!clipId) return;
+  enqueueClip(
+  clipId: string,
+  delay?: number | { delayMs?: number }
+) {
+  if (this.closed) return;
+  if (!clipId) return;
 
-    this.jobs.push({ kind: "clip", clipId, delayMs });
-    this.processQueue();
+  let delayMs: number | undefined;
+
+  if (typeof delay === "number") {
+    delayMs = delay;
+  } else if (delay && typeof delay.delayMs === "number") {
+    delayMs = delay.delayMs;
   }
+
+  this.jobs.push({ kind: "clip", clipId, delayMs });
+  this.processQueue();
+}
+
 
   // Cancel current TTS and clear pending jobs
   bargeIn() {

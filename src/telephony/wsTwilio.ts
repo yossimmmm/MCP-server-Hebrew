@@ -6,6 +6,9 @@ import { createGoogleSession } from "../stt/google.js";
 import { createHebrewChirp3Stream } from "../stt/googleChirpV2.js";
 import { LlmSession } from "../nlu/gemini.js";
 import TtsQueue from "../tts/ttsQueue.js";
+import { WAITING_PHRASES } from "../nlu/waitingPhrases.js";
+
+
 
 // Normalized barge-in threshold: clamp between 3 and 5 characters
 const RAW_BARGE_IN_MIN_CHARS = Number(process.env.BARGE_IN_MIN_CHARS || "5");
@@ -23,6 +26,18 @@ const PACER_MS = Number(
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "eleven_v3";
 const DEFAULT_LANG = process.env.TTS_LANGUAGE_CODE || "he";
 const CALL_GREETING = process.env.CALL_GREETING || "";
+const CALL_GREETING_CLIP_ID =
+  (process.env.CALL_GREETING_CLIP_ID || "").trim();
+
+function pickRandomWaitingClipId(): string | null {
+  if (!WAITING_PHRASES.length) return null;
+  const pool = WAITING_PHRASES.filter(
+    (p) => p.id !== CALL_GREETING_CLIP_ID // ליתר ביטחון, לא לבחור את הגריטינג עצמו
+  );
+  const arr = pool.length ? pool : WAITING_PHRASES;
+  const idx = Math.floor(Math.random() * arr.length);
+  return arr[idx]?.id ?? null;
+}
 
 // How long to wait for a preview before falling back to full call (ms)
 const LLM_PREVIEW_WAIT_MS = Number(
@@ -388,14 +403,40 @@ export function attachTwilioWs(server: http.Server) {
 
         switch (msg.event) {
           case "start":
-            streamSid = msg.start?.streamSid;
+          streamSid = msg.start?.streamSid;
+          console.log(
+            `[twilio] start streamSid=${streamSid} (BARGE_IN_MIN_CHARS=${BARGE_IN_MIN_CHARS})`
+          );
+
+          // 1) קודם כל – גריטינג כאודיו מוכן אם יש
+          if (CALL_GREETING_CLIP_ID) {
             console.log(
-              `[twilio] start streamSid=${streamSid} (BARGE_IN_MIN_CHARS=${BARGE_IN_MIN_CHARS})`
+              "[TTS] enqueue static greeting clip:",
+              CALL_GREETING_CLIP_ID
             );
-            if (CALL_GREETING) {
-              ttsQueue.enqueueText(CALL_GREETING);
+            // אין דיליי לפני הגריטינג – שיישמע כמעט מייד
+            ttsQueue.enqueueClip(CALL_GREETING_CLIP_ID, { delayMs: 0 });
+          } else if (CALL_GREETING) {
+            // פולבאק: אם אין קליפ, נשתמש בטקסט הישן
+            console.log("[TTS] enqueue TEXT greeting (fallback)");
+            ttsQueue.enqueueText(CALL_GREETING);
+          }
+
+          // 2) מיד אחרי זה – משפט WAITING רנדומלי לפתיחת השיחה
+          {
+            const randomId = pickRandomWaitingClipId();
+            if (randomId) {
+              console.log(
+                "[WAIT] enqueue initial random waiting clip:",
+                randomId
+              );
+              // גם כאן בלי דיליי – הוא ממילא יגיע אחרי הגריטינג עצמו
+              ttsQueue.enqueueClip(randomId, { delayMs: 0 });
             }
-            break;
+          }
+
+          break;
+
 
           case "media":
             if (msg.media?.payload) sttWrite(msg.media.payload);
